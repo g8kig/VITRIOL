@@ -1,0 +1,21 @@
+# PCIe FFI Bindings for VITRIOL
+
+[bindings]
+# PCI subsystem
+pci_get_device = { sig = "pci_get_device(vendor: UInt, device: UInt, from: UInt) -> UInt", note = "Find PCI device by vendor:device ID" }
+pci_iomap = { sig = "pci_iomap(dev: UInt, bar: UInt, len: UInt) -> UInt", note = "Map BAR into kernel virtual address" }
+pci_iounmap = { sig = "pci_iounmap(dev: UInt, addr: UInt)", note = "Unmap BAR" }
+pci_dev_put = { sig = "pci_dev_put(dev: UInt)", note = "Release PCI device reference" }
+
+# DMA / P2P
+pci_p2pdma_map_sg = { sig = "pci_p2pdma_map_sg(dev: UInt, sg: UInt, count: UInt) -> Int", note = "Setup P2P DMA scatter-gather list" }
+dma_alloc_coherent = { sig = "dma_alloc_coherent(dev: UInt, size: UInt, dma_handle: UInt, flag: UInt) -> UInt", note = "Allocate DMA-coherent memory" }
+dma_free_coherent = { sig = "dma_free_coherent(dev: UInt, size: UInt, cpu_addr: UInt, dma_handle: UInt)", note = "Free DMA-coherent memory" }
+
+# Kernel print
+printk = { sig = "printk(fmt: String) -> Int", note = "Kernel printk for logging" }
+
+# Memory operations
+memcpy = { sig = "memcpy(dest: UInt, src: UInt, n: UInt) -> UInt", note = "Copy memory" }
+ioremap = { sig = "ioremap(phys_addr: UInt, size: UInt) -> UInt", note = "Map physical to virtual" }
+iounmap = { sig = "iounmap(addr: UInt)", note = "Unmap I/O memory" }

@@ -1,0 +1,3 @@
+#![target(linux_kernel)]
+
+txn init [true][true] { term; };

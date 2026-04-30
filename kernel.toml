@@ -1,0 +1,27 @@
+# Kernel FFI Bindings for VITRIOL
+
+[printk]
+sig = "printk(fmt: String) -> Int"
+note = "Kernel printk (variadic - use wrapper in practice)"
+
+[pci_get_device]
+sig = "pci_get_device(vendor: UInt, device: UInt, from: UInt) -> UInt"
+note = "Find PCI device by vendor:device ID"
+
+[pci_iomap]
+sig = "pci_iomap(dev: UInt, bar: UInt, len: UInt) -> UInt"
+note = "Map BAR into kernel virtual address"
+
+[pci_iounmap]
+sig = "pci_iounmap(dev: UInt, addr: UInt)"
+note = "Unmap BAR"
+
+[pci_dev_put]
+sig = "pci_dev_put(dev: UInt)"
+note = "Release PCI device reference"
+
+[dma_alloc_coherent]
+sig = "dma_alloc_coherent(dev: UInt, size: UInt, dma_handle: UInt, flag: UInt) -> UInt"
+
+[dma_free_coherent]
+sig = "dma_free_coherent(dev: UInt, size: UInt, cpu_addr: UInt, dma_handle: UInt)"

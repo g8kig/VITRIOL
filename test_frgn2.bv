@@ -1,0 +1,3 @@
+#![target(linux_kernel)]
+
+frgn test_func(x: Int, y: String) -> Result<Int, Err> from "kernel.toml";
