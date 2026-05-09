@@ -42,15 +42,24 @@ MAX_TEMP = 85  # GPU thermal limit (°C)
 #   'vram' - Keep recent context in VRAM (fastest, limited by VRAM size)
 #   'ssd' - Stream context from SSD (slower, "infinite" context)
 #   'hybrid' - Active context in VRAM, archive to SSD (balanced)
-CONTEXT_STRATEGY = 'hybrid'
+#   'stream' - Intelligent context streaming from SSD (RAG-style)
+CONTEXT_STRATEGY = 'stream'
+
+# Context streaming configuration
+CONTEXT_STREAM_TOP_K = 3  # Number of relevant context chunks to stream
+CONTEXT_STREAM_RELEVANCE_THRESHOLD = 0.3  # Minimum similarity score
 
 # Context offloading strategy
 # Options:
 #   'vram' - Keep recent context in VRAM (fastest, limited by VRAM size)
 #   'ssd' - Stream context from SSD (slower, "infinite" context)
 #   'hybrid' - Active context in VRAM, archive to SSD (balanced)
-CONTEXT_STRATEGY = 'hybrid'
-MAX_TEMP = 85  # GPU thermal limit (°C)
+#   'stream' - Intelligent context streaming from SSD (RAG-style)
+CONTEXT_STRATEGY = 'stream'
+
+# Context streaming configuration
+CONTEXT_STREAM_TOP_K = 3  # Number of relevant context chunks to stream
+CONTEXT_STREAM_RELEVANCE_THRESHOLD = 0.3  # Minimum similarity score
 
 
 @dataclass
@@ -114,6 +123,92 @@ def retrieve_context_from_ssd(archive_path: str = "/tmp/vitriol_context_archive.
         return []
 
 
+def chunk_messages_for_streaming(messages: List[Dict[str, Any]], chunk_size: int = 5) -> List[Dict[str, Any]]:
+    """
+    Context Streaming: Split messages into overlapping chunks for better retrieval
+    Each chunk contains context from neighboring messages
+    """
+    chunks = []
+    for i in range(0, len(messages), chunk_size):
+        chunk = messages[i:i + chunk_size * 2]  # Overlapping chunks
+        if chunk:
+            chunks.append({
+                'id': f'chunk_{i}',
+                'messages': chunk,
+                'text': ' '.join([m.get('content', '') for m in chunk if m.get('content')]),
+                'start_idx': i,
+                'end_idx': i + len(chunk)
+            })
+    return chunks
+
+
+def compute_relevance_score(query: str, chunk_text: str) -> float:
+    """
+    Context Streaming: Simple relevance scoring using keyword overlap
+    Phase 2: Replace with embedding-based similarity (e.g., sentence-transformers)
+    """
+    query_words = set(query.lower().split())
+    chunk_words = set(chunk_text.lower().split())
+    
+    if not query_words or not chunk_words:
+        return 0.0
+    
+    # Jaccard similarity
+    intersection = query_words & chunk_words
+    union = query_words | chunk_words
+    return len(intersection) / len(union) if union else 0.0
+
+
+def stream_relevant_context(
+    current_query: str,
+    archive_path: str = "/tmp/vitriol_context_archive.json",
+    top_k: int = CONTEXT_STREAM_TOP_K,
+    threshold: float = CONTEXT_STREAM_RELEVANCE_THRESHOLD
+) -> List[Dict[str, Any]]:
+    """
+    Context Streaming Strategy: Retrieve and inject relevant context from SSD
+    
+    1. Load archived chunks
+    2. Score each chunk by relevance to current query
+    3. Return top-K most relevant chunks
+    4. Inject into conversation as "system context"
+    """
+    try:
+        # Load archived context
+        archived_messages = retrieve_context_from_ssd(archive_path)
+        if not archived_messages:
+            logger.info("No archived context to stream")
+            return []
+        
+        # Chunk the archived context
+        chunks = chunk_messages_for_streaming(archived_messages, chunk_size=5)
+        logger.info(f"Split context into {len(chunks)} chunks")
+        
+        # Score each chunk by relevance
+        scored_chunks = []
+        for chunk in chunks:
+            score = compute_relevance_score(current_query, chunk['text'])
+            if score >= threshold:
+                scored_chunks.append((score, chunk))
+        
+        # Sort by relevance and take top-K
+        scored_chunks.sort(key=lambda x: x[0], reverse=True)
+        top_chunks = scored_chunks[:top_k]
+        
+        logger.info(f"Streaming {len(top_chunks)} relevant context chunks (scores: {[s for s, _ in top_chunks]})")
+        
+        # Convert chunks back to messages
+        streamed_messages = []
+        for score, chunk in top_chunks:
+            streamed_messages.extend(chunk['messages'])
+        
+        return streamed_messages
+        
+    except Exception as e:
+        logger.error(f"Context streaming failed: {e}")
+        return []
+
+
 def estimate_tokens(text: str) -> int:
     """Rough token estimation (4 chars ≈ 1 token for English)"""
     return len(text) // 4
@@ -141,7 +236,7 @@ def sublimate_content(content: str) -> str:
     return content.strip()
 
 
-def rectify_context(messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], RectificationStats]:
+def rectify_context(messages: List[Dict[str, Any]], current_query: str = "") -> tuple[List[Dict[str, Any]], RectificationStats]:
     """
     Perform alchemical rectification on message context.
     
@@ -149,11 +244,13 @@ def rectify_context(messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]
     - 'vram': Keep only recent messages (minimize VRAM usage)
     - 'ssd': Archive old messages to SSD before truncating
     - 'hybrid': Archive + keep recent messages in VRAM
+    - 'stream': Archive + intelligently stream relevant context from SSD
     
     Operations:
     1. Calcination (Truncation): Keep system + last N messages
     2. Sublimation (Metadata Stripping): Remove reasoning/tool bloat
     3. Coagulation (Final Formatting): Ensure clean ChatML format
+    4. Streaming (Optional): Inject relevant archived context
     """
     if not messages:
         return messages, RectificationStats(0, 0, 0, False, 0.0)
@@ -165,11 +262,18 @@ def rectify_context(messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]
     )
     
     # Context Offloading: Archive old messages to SSD
-    if CONTEXT_STRATEGY in ['ssd', 'hybrid'] and len(messages) > MAX_MESSAGES_TO_KEEP:
+    if CONTEXT_STRATEGY in ['ssd', 'hybrid', 'stream'] and len(messages) > MAX_MESSAGES_TO_KEEP:
         messages_to_archive = messages[:-MAX_MESSAGES_TO_KEEP]
         archive_path = archive_context_to_ssd(messages_to_archive)
         if archive_path:
             logger.info(f"Archived {len(messages_to_archive)} messages to SSD")
+    
+    # Context Streaming: Inject relevant archived context
+    streamed_messages = []
+    if CONTEXT_STRATEGY == 'stream' and current_query:
+        streamed_messages = stream_relevant_context(current_query)
+        if streamed_messages:
+            logger.info(f"Streaming {len(streamed_messages)} relevant context messages from SSD")
     
     # 1. Calcination: Truncate middle messages
     messages_dropped = 0
@@ -187,6 +291,19 @@ def rectify_context(messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]
         # Restore system message
         if system_msg:
             messages = [system_msg] + messages
+    
+    # Inject streamed context as system message
+    if streamed_messages:
+        streamed_text = "\n\n[Relevant Context from Archive]\n"
+        for msg in streamed_messages[-5:]:  # Last 5 streamed messages
+            streamed_text += f"{msg['role']}: {msg['content'][:200]}...\n"
+        streamed_text += "[End Context]\n\n"
+        
+        # Add as system message or append to existing system message
+        if messages and messages[0].get('role') == 'system':
+            messages[0]['content'] += streamed_text
+        else:
+            messages.insert(0, {'role': 'system', 'content': streamed_text})
     
     # 2. Sublimation: Strip metadata from each message
     metadata_stripped = False
@@ -248,6 +365,7 @@ def proxy_chat_completions():
     1. Thermal polling (halts if GPU >= 85°C)
     2. Context truncation (max 7k tokens)
     3. Metadata stripping (reasoning/tools)
+    4. Context streaming (injects relevant archived context)
     """
     try:
         data = request.json
@@ -267,8 +385,13 @@ def proxy_chat_completions():
         messages = data.get('messages', [])
         logger.info(f"Received request with {len(messages)} messages")
         
-        # === GUARDRAIL 1 & 2: Context Rectification ===
-        rectified_messages, stats = rectify_context(messages)
+        # Extract current query for context streaming
+        current_query = ""
+        if messages and messages[-1].get('role') == 'user':
+            current_query = messages[-1].get('content', '')[:500]  # First 500 chars as query
+        
+        # === GUARDRAIL 1 & 2: Context Rectification with Streaming ===
+        rectified_messages, stats = rectify_context(messages, current_query)
         
         # Log rectification stats
         logger.info(

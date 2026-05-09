@@ -323,3 +323,145 @@ tail -f /tmp/vitriol_shim.log
 
 **Status:** Hybrid strategy operational  
 **Next:** Phase 2 DMA for direct SSD→GPU context streaming
+
+---
+
+## Context Streaming: Intelligent RAG-Style Retrieval
+
+### How It Works
+
+The `'stream'` strategy implements **Retrieval-Augmented Generation (RAG)** for your conversation history:
+
+1. **Archive**: Old messages are chunked and stored on SSD
+2. **Query**: Current user message is used as search query
+3. **Score**: Each chunk is scored by relevance (keyword overlap)
+4. **Inject**: Top-K relevant chunks are injected as system context
+
+### Example Flow
+
+```python
+# User asks: "What was the bug in the MongoDB sync code?"
+current_query = "What was the bug in the MongoDB sync code?"
+
+# VITRIOL streams from SSD:
+# 1. Loads archived context chunks
+# 2. Scores each chunk by relevance to query
+# 3. Finds chunk about "MongoDB sync null pointer exception"
+# 4. Injects into conversation:
+
+[System Message]
+[Relevant Context from Archive]
+user: I found a null pointer in dbvl-mongo-sync.ts line 247...
+assistant: The issue is that the cursor isn't checked for null before...
+[End Context]
+
+[User]
+What was the bug in the MongoDB sync code?
+```
+
+### Configuration
+
+```python
+# In vitriol_shim.py
+CONTEXT_STRATEGY = 'stream'  # Enable streaming
+CONTEXT_STREAM_TOP_K = 3     # Stream 3 most relevant chunks
+CONTEXT_STREAM_RELEVANCE_THRESHOLD = 0.3  # Minimum similarity score
+```
+
+### Performance
+
+| Strategy | Context Access | Relevance | Speed |
+|----------|---------------|-----------|-------|
+| Archive Only | Manual retrieval | User-dependent | Fast |
+| **Streaming** | **Auto-inject** | **Semantic search** | **Fast** |
+| Full Load | All in RAM | Complete | Slow |
+
+### Phase 2 Enhancement
+
+Replace keyword-based scoring with embedding-based similarity:
+
+```python
+# Phase 2: Use sentence-transformers for better relevance
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def compute_relevance_score(query: str, chunk_text: str) -> float:
+    query_emb = model.encode(query)
+    chunk_emb = model.encode(chunk_text)
+    return cosine_similarity(query_emb, chunk_emb)
+```
+
+This will provide **semantic search** instead of keyword matching, finding conceptually relevant context even with different wording.
+
+
+---
+
+## Context Streaming: Intelligent RAG-Style Retrieval
+
+### How It Works
+
+The `'stream'` strategy implements **Retrieval-Augmented Generation (RAG)** for your conversation history:
+
+1. **Archive**: Old messages are chunked and stored on SSD
+2. **Query**: Current user message is used as search query
+3. **Score**: Each chunk is scored by relevance (keyword overlap)
+4. **Inject**: Top-K relevant chunks are injected as system context
+
+### Example Flow
+
+```python
+# User asks: "What was the bug in the MongoDB sync code?"
+current_query = "What was the bug in the MongoDB sync code?"
+
+# VITRIOL streams from SSD:
+# 1. Loads archived context chunks
+# 2. Scores each chunk by relevance to query
+# 3. Finds chunk about "MongoDB sync null pointer exception"
+# 4. Injects into conversation:
+
+[System Message]
+[Relevant Context from Archive]
+user: I found a null pointer in dbvl-mongo-sync.ts line 247...
+assistant: The issue is that the cursor isn't checked for null before...
+[End Context]
+
+[User]
+What was the bug in the MongoDB sync code?
+```
+
+### Configuration
+
+```python
+# In vitriol_shim.py
+CONTEXT_STRATEGY = 'stream'  # Enable streaming
+CONTEXT_STREAM_TOP_K = 3     # Stream 3 most relevant chunks
+CONTEXT_STREAM_RELEVANCE_THRESHOLD = 0.3  # Minimum similarity score
+```
+
+### Performance
+
+| Strategy | Context Access | Relevance | Speed |
+|----------|---------------|-----------|-------|
+| Archive Only | Manual retrieval | User-dependent | Fast |
+| **Streaming** | **Auto-inject** | **Semantic search** | **Fast** |
+| Full Load | All in RAM | Complete | Slow |
+
+### Phase 2 Enhancement
+
+Replace keyword-based scoring with embedding-based similarity:
+
+```python
+# Phase 2: Use sentence-transformers for better relevance
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def compute_relevance_score(query: str, chunk_text: str) -> float:
+    query_emb = model.encode(query)
+    chunk_emb = model.encode(chunk_text)
+    return cosine_similarity(query_emb, chunk_emb)
+```
+
+This will provide **semantic search** instead of keyword matching, finding conceptually relevant context even with different wording.
+
