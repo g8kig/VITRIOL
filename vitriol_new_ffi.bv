@@ -23,11 +23,14 @@ let current_layer: UInt = 0;
 const MAX_LAYERS: UInt = 1000;
 
 // GPU Device ID: NVIDIA GTX 1070 Ti = 10de:1b82
+// Hardware Analysis v2.0: BAR 1 is the 256MB VRAM window (not BAR 0)
 const GPU_VENDOR: UInt = 0x10de;
 const GPU_DEVICE: UInt = 0x1b82;
-const BAR_0: UInt = 0;
+const BAR_VRAM: UInt = 1;  // BAR 1: 256MB prefetchable VRAM (per lspci)
+const APERTURE_SIZE: UInt = 0x10000000;  // 256MB
 
 // --- Init: V.I.T. (Visita Interiora Terrae) ---
+// Hardware Analysis v2.0: Maps BAR 1 (256MB VRAM window) instead of BAR 0
 #[c, section(".init.text")]
 rct txn init [gpu_mapped == false]
   [gpu_mapped == true]
@@ -38,16 +41,16 @@ rct txn init [gpu_mapped == false]
     let result = pci_get_device(GPU_VENDOR, GPU_DEVICE, 0);
     [result > 0] {
         &gpu_dev = result;
-        printk("VITRIOL: GPU device found\n");
+        printk("VITRIOL: GPU device found (10de:1b82)\n");
     };
 
-    // Map BAR 0 (VRAM)
+    // Map BAR 1 (VRAM) - 256MB aperture per hardware analysis
     [gpu_dev > 0] {
-        let bar_result = pci_iomap(gpu_dev, BAR_0, 0x1000000);
+        let bar_result = pci_iomap(gpu_dev, BAR_VRAM, APERTURE_SIZE);
         [bar_result > 0] {
             &gpu_bar_addr = bar_result;
             &gpu_mapped = true;
-            printk("VITRIOL: GPU BAR mapped\n");
+            printk("VITRIOL: Mercurial Bridge established via BAR 1 (256MB)\n");
         };
     };
 

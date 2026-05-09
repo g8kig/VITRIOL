@@ -13,13 +13,43 @@
 #define GPU_VENDOR 4318
 #define GPU_DEVICE 7042
 #define BAR_0 0
-extern void printk(char * fmt);
-extern uint32_t pci_get_device(uint32_t vendor, uint32_t device, uint32_t from);
-extern uint32_t pci_iomap(uint32_t dev, uint32_t bar, uint32_t len);
-extern bool pci_iounmap(uint32_t dev, uint32_t addr);
-extern bool pci_dev_put(uint32_t dev);
-extern void write_reg(uint32_t val);
-extern uint32_t read_reg(void);
+
+/* FFI Stub Implementations (test mode - safe, no real hardware) */
+static uint32_t pci_get_device(uint32_t vendor, uint32_t device, uint32_t from) {
+    printk("[VITRIOL-STUB] pci_get_device called\\n");
+    return 1;  // stub: success handle
+}
+
+static uint32_t pci_iomap(uint32_t dev, uint32_t bar, uint32_t len) {
+    printk("[VITRIOL-STUB] pci_iomap called\\n");
+    return 1;  // stub: success handle
+}
+
+static bool pci_iounmap(uint32_t dev, uint32_t addr) {
+    printk("[VITRIOL-STUB] pci_iounmap called\\n");
+    return true;  // stub: success
+}
+
+static bool pci_dev_put(uint32_t dev) {
+    printk("[VITRIOL-STUB] pci_dev_put called\\n");
+    return true;  // stub: success
+}
+
+static void write_reg(uint32_t val) {
+    printk("[VITRIOL-STUB] write_reg called\\n");
+}
+
+static uint32_t read_reg(void) {
+    printk("[VITRIOL-STUB] read_reg called\\n");
+    return 1;  // stub: success handle
+}
+
+
+
+/* Module parameters */
+static int test_mode = 1;
+module_param(test_mode, int, 0644);
+MODULE_PARM_DESC(test_mode, "1=stub mode (safe), 0=real hardware (DANGER)");
 
 typedef struct {
     uint32_t gpu_dev;
@@ -40,18 +70,17 @@ void state_init(void) {
     state->current_layer = 0;
 }
 
-bool init(void) {
-    /* pre: Eq(Identifier("gpu_mapped"), Bool(false)) */
+bool init(void) {    /* pre: Eq(Identifier("gpu_mapped"), Bool(false)) */
     printk("VITRIOL: Visita Interiora Terrae...\n");
     uint32_t result = pci_get_device(4318, 7042, 0);
-    if ((state->result > 0)) {
-    state->gpu_dev = state->result;
+    if ((result > 0)) {
+    state->gpu_dev = result;
     printk("VITRIOL: GPU device found\n");
     }
     if ((state->gpu_dev > 0)) {
     uint32_t bar_result = pci_iomap(state->gpu_dev, 0, 16777216);
-    if ((state->bar_result > 0)) {
-    state->gpu_bar_addr = state->bar_result;
+    if ((bar_result > 0)) {
+    state->gpu_bar_addr = bar_result;
     state->gpu_mapped = true;
     printk("VITRIOL: GPU BAR mapped\n");
     }
@@ -61,32 +90,28 @@ bool init(void) {
     return true;
 }
 
-bool calc_layer(void) {
-    /* pre: And(Not(Identifier("dma_active")), Lt(Identifier("current_layer"), Identifier("MAX_LAYERS"))) */
+bool calc_layer(void) {    /* pre: And(Not(Identifier("dma_active")), Lt(Identifier("current_layer"), Identifier("MAX_LAYERS"))) */
     state->current_layer = (state->current_layer + 1);
     /* transaction complete */
     /* post: Eq(Identifier("current_layer"), Add(PriorState("current_layer"), Integer(1))) */
     return true;
 }
 
-bool stream_layer(void) {
-    /* pre: And(Not(Identifier("dma_active")), Lt(Identifier("current_layer"), Identifier("MAX_LAYERS"))) */
+bool stream_layer(void) {    /* pre: And(Not(Identifier("dma_active")), Lt(Identifier("current_layer"), Identifier("MAX_LAYERS"))) */
     state->dma_active = true;
     /* transaction complete */
     /* post: Eq(Identifier("dma_active"), Bool(true)) */
     return true;
 }
 
-bool dma_done(void) {
-    /* pre: Eq(Identifier("dma_active"), Bool(true)) */
+bool dma_done(void) {    /* pre: Eq(Identifier("dma_active"), Bool(true)) */
     state->dma_active = false;
     /* transaction complete */
     /* post: Eq(Identifier("dma_active"), Bool(false)) */
     return true;
 }
 
-bool cleanup(void) {
-    /* pre: Eq(Identifier("gpu_mapped"), Bool(true)) */
+bool cleanup(void) {    /* pre: Eq(Identifier("gpu_mapped"), Bool(true)) */
     if ((state->gpu_bar_addr != 0)) {
     /* FFI call to pci_iounmap with error handling */
     bool _result_pci_iounmap = pci_iounmap(state->gpu_dev, state->gpu_bar_addr);

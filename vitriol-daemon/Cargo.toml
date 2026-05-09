@@ -1,0 +1,19 @@
+[package]
+name = "vitriol-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "VITRIOL daemon - Unix socket API + llama.cpp inference"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+
+# Note: llama.cpp integration pending
+# Will use either:
+# - llama-cpp-sys (raw binding) or
+# - candle (Rust ML framework) or
+# - cpython for llama.cpp binary

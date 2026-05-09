@@ -1,0 +1,81 @@
+# VITRIOL - .gitignore
+
+# Build artifacts
+*.o
+*.ko
+*.ko.cmd
+*.mod
+*.mod.o
+*.mod.cmd
+*.symvers
+*.symvers.cmd
+modules.order
+modules.order.cmd
+.*.cmd
+*.a
+*.so
+*.so.*
+build/
+.tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+dist/
+eggs/
+
+# Rust
+/target/
+**/target/
+*.rs.bk
+Cargo.lock
+
+# Brief compiler output
+out_test/
+*_generated.c
+*_generated.h
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+/tmp/
+*.tmp
+*.temp
+
+# Test outputs
+test_results/
+coverage/
+
+# Swap files (large system files)
+/swapfile
+/swapfile2
+/swapfile3
+
+# Model files (too large for git)
+*.gguf
+*.bin
+*.pt
+*.pth
+models/
+
+# OS files
+Thumbs.db
+.DS_Store
