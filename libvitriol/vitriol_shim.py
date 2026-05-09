@@ -34,8 +34,22 @@ KOBOLD_URL = "http://localhost:5001/v1/chat/completions"
 KOBOLD_STATUS_URL = "http://localhost:5001/api/v1/info"
 MAX_CONTEXT_TOKENS = 7000
 MAX_MESSAGES_TO_KEEP = 4
-SHIM_PORT = 5010  # Changed to avoid port conflicts
+SHIM_PORT = 5010
 MAX_TEMP = 85  # GPU thermal limit (°C)
+
+# Context offloading strategy
+# Options:
+#   'vram' - Keep recent context in VRAM (fastest, limited by VRAM size)
+#   'ssd' - Stream context from SSD (slower, "infinite" context)
+#   'hybrid' - Active context in VRAM, archive to SSD (balanced)
+CONTEXT_STRATEGY = 'hybrid'
+
+# Context offloading strategy
+# Options:
+#   'vram' - Keep recent context in VRAM (fastest, limited by VRAM size)
+#   'ssd' - Stream context from SSD (slower, "infinite" context)
+#   'hybrid' - Active context in VRAM, archive to SSD (balanced)
+CONTEXT_STRATEGY = 'hybrid'
 MAX_TEMP = 85  # GPU thermal limit (°C)
 
 
@@ -64,6 +78,40 @@ def get_gpu_temp() -> int:
     except Exception as e:
         logger.warning(f"Thermal poll failed: {e}")
         return 0
+
+
+def archive_context_to_ssd(messages: List[Dict[str, Any]], archive_path: str = "/tmp/vitriol_context_archive.json") -> str:
+    """
+    Context Offloading Strategy 2: Archive old context to SSD
+    Returns archive file path for potential retrieval
+    """
+    try:
+        with open(archive_path, 'w') as f:
+            json.dump({
+                'timestamp': datetime.now().isoformat(),
+                'messages': messages,
+                'token_count': sum(estimate_tokens(m.get('content', '')) for m in messages)
+            }, f, indent=2)
+        logger.info(f"Context archived to {archive_path} ({len(messages)} messages)")
+        return archive_path
+    except Exception as e:
+        logger.error(f"Context archival failed: {e}")
+        return ""
+
+
+def retrieve_context_from_ssd(archive_path: str = "/tmp/vitriol_context_archive.json") -> List[Dict[str, Any]]:
+    """
+    Context Offloading Strategy 2: Retrieve archived context from SSD
+    Returns messages list or empty list on error
+    """
+    try:
+        with open(archive_path, 'r') as f:
+            data = json.load(f)
+        logger.info(f"Context retrieved from {archive_path}")
+        return data.get('messages', [])
+    except Exception as e:
+        logger.warning(f"Context retrieval failed: {e}")
+        return []
 
 
 def estimate_tokens(text: str) -> int:
@@ -97,6 +145,11 @@ def rectify_context(messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]
     """
     Perform alchemical rectification on message context.
     
+    Strategies:
+    - 'vram': Keep only recent messages (minimize VRAM usage)
+    - 'ssd': Archive old messages to SSD before truncating
+    - 'hybrid': Archive + keep recent messages in VRAM
+    
     Operations:
     1. Calcination (Truncation): Keep system + last N messages
     2. Sublimation (Metadata Stripping): Remove reasoning/tool bloat
@@ -110,6 +163,13 @@ def rectify_context(messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]
         estimate_tokens(m.get('content', '') + m.get('reasoning_content', ''))
         for m in messages
     )
+    
+    # Context Offloading: Archive old messages to SSD
+    if CONTEXT_STRATEGY in ['ssd', 'hybrid'] and len(messages) > MAX_MESSAGES_TO_KEEP:
+        messages_to_archive = messages[:-MAX_MESSAGES_TO_KEEP]
+        archive_path = archive_context_to_ssd(messages_to_archive)
+        if archive_path:
+            logger.info(f"Archived {len(messages_to_archive)} messages to SSD")
     
     # 1. Calcination: Truncate middle messages
     messages_dropped = 0
@@ -293,6 +353,92 @@ def rectify_only():
                 "reduction_percent": stats.reduction_percent
             },
             "rectified_messages": rectified
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/context/archive', methods=['POST'])
+def archive_context_endpoint():
+    """
+    Manually archive context to SSD.
+    Useful for long conversations where you want to preserve history.
+    """
+    try:
+        data = request.json
+        messages = data.get('messages', [])
+        archive_path = data.get('path', '/tmp/vitriol_context_archive.json')
+        
+        result_path = archive_context_to_ssd(messages, archive_path)
+        if result_path:
+            return jsonify({
+                "status": "ok",
+                "archive_path": result_path,
+                "messages_archived": len(messages)
+            })
+        else:
+            return jsonify({"error": "Archival failed"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/context/retrieve', methods=['GET'])
+def retrieve_context_endpoint():
+    """
+    Retrieve archived context from SSD.
+    Returns messages list for potential injection into conversation.
+    """
+    try:
+        archive_path = request.args.get('path', '/tmp/vitriol_context_archive.json')
+        messages = retrieve_context_from_ssd(archive_path)
+        
+        return jsonify({
+            "status": "ok",
+            "messages": messages,
+            "message_count": len(messages)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/context/archive', methods=['POST'])
+def archive_context_endpoint():
+    """
+    Manually archive context to SSD.
+    Useful for long conversations where you want to preserve history.
+    """
+    try:
+        data = request.json
+        messages = data.get('messages', [])
+        archive_path = data.get('path', '/tmp/vitriol_context_archive.json')
+        
+        result_path = archive_context_to_ssd(messages, archive_path)
+        if result_path:
+            return jsonify({
+                "status": "ok",
+                "archive_path": result_path,
+                "messages_archived": len(messages)
+            })
+        else:
+            return jsonify({"error": "Archival failed"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/context/retrieve', methods=['GET'])
+def retrieve_context_endpoint():
+    """
+    Retrieve archived context from SSD.
+    Returns messages list for potential injection into conversation.
+    """
+    try:
+        archive_path = request.args.get('path', '/tmp/vitriol_context_archive.json')
+        messages = retrieve_context_from_ssd(archive_path)
+        
+        return jsonify({
+            "status": "ok",
+            "messages": messages,
+            "message_count": len(messages)
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500

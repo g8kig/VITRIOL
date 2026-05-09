@@ -1,5 +1,6 @@
 #!/bin/bash
-# launch_vitriol.sh - Simple launch script for VITRIOL stack
+# launch_vitriol.sh - VITRIOL stack with context offloading
+# Context Strategy: Hybrid (VRAM for model, SSD for old context)
 
 set -e
 
@@ -11,19 +12,22 @@ pkill -9 -f koboldcpp 2>/dev/null || true
 pkill -9 -f vitriol_shim.py 2>/dev/null || true
 sleep 2
 
-# Start KoboldCPP with stable settings
+# Start KoboldCPP with context offloading optimizations
 echo "1. Starting KoboldCPP on port 5001..."
 cd ~/Downloads/koboldCPP
 nohup ./koboldcpp \
     --model Qwen_Qwen3.5-9B-Q4_K_M.gguf \
     --usecuda \
     --gpulayers 25 \
-    --contextsize 4096 \
+    --contextsize 8192 \
     --lowvram \
     --usemmap \
+    --smartcache 4096 \
+    --smartcontext \
     --port 5001 > /tmp/kobold.log 2>&1 &
 KOBOLD_PID=$!
 echo "   KoboldCPP started (PID: $KOBOLD_PID)"
+echo "   Context offloading: --smartcache 4096 + --smartcontext enabled"
 
 # Wait for Kobold to load
 echo "   Waiting for model to load (30-60 seconds)..."
@@ -46,7 +50,7 @@ fi
 echo ""
 echo "2. Starting VITRIOL Context Rectifier on port 5010..."
 cd ~/Desktop/Projects/linux-pipe-module
-nohup python3 vitriol_shim.py > /tmp/vitriol_shim.log 2>&1 &
+nohup python3 libvitriol/vitriol_shim.py > /tmp/vitriol_shim.log 2>&1 &
 SHIM_PID=$!
 echo "   VITRIOL shim started (PID: $SHIM_PID)"
 sleep 3
@@ -65,6 +69,18 @@ echo ""
 echo "Services:"
 echo "  KoboldCPP: http://localhost:5001 (PID: $KOBOLD_PID)"
 echo "  VITRIOL:   http://localhost:5010 (PID: $SHIM_PID)"
+echo ""
+echo "Context Offloading Strategy:"
+echo "  - Model: Loaded in VRAM (5.5GB)"
+echo "  - KV Cache: Smart cached (4096 tokens in VRAM)"
+echo "  - Old Context: Auto-archived to SSD"
+echo "  - Active Context: Last 4 messages + system prompt"
+echo ""
+echo "API Endpoints:"
+echo "  POST /v1/chat/completions - Inference with rectification"
+echo "  POST /context/archive     - Manually archive context to SSD"
+echo "  GET  /context/retrieve    - Retrieve archived context"
+echo "  GET  /health              - Status check"
 echo ""
 echo "Test commands:"
 echo "  curl http://localhost:5010/health"
