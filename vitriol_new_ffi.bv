@@ -1,42 +1,21 @@
-#![ffi.kernel, bind("./kernel.toml")]
+#![ffi.kernel, bind("./kernel.dbv")]
 
-// --- FFI Bindings (new simplified syntax) ---
-// Fire-and-forget: no return value expected
-frgn! printk(fmt: String);
+// --- FFI Bindings (now loaded from kernel.dbv) ---
+// All FFI functions and constants are defined in kernel.dbv
+// This includes: pci_*, dma_*, memory barriers, and hardware constants
 
-// Standard FFI with Result return
-frgn pci_get_device(vendor: UInt, device: UInt, from: UInt) -> Result<UInt, Err>;
-frgn pci_iomap(dev: UInt, bar: UInt, len: UInt) -> Result<UInt, Err>;
-frgn pci_iounmap(dev: UInt, addr: UInt) -> Result<Bool, Err>;
-frgn pci_dev_put(dev: UInt) -> Result<Bool, Err>;
-
-// Hardware register access (explicit address)
-frgn! write_reg @ 0x40001000 (val: UInt);
-frgn read_reg @ 0x40001000 () -> Result<UInt, Err>;
+// Import hardware constants from kernel.dbv
+// GPU_VENDOR, GPU_DEVICE, BAR_CONTROL, BAR_DATA, MAX_LAYERS, etc.
 
 // --- State: The Vessels ---
+// All hardware constants loaded from kernel.dbv
 let gpu_dev: UInt = 0;
 let gpu_bar_addr: UInt = 0;      // BAR 1: Data Plane (VRAM Window)
 let gpu_ctrl_addr: UInt = 0;     // BAR 0: Control Plane (Registers)
 let gpu_mapped: Bool = false;
 let dma_active: Bool = false;
 let current_layer: UInt = 0;
-const MAX_LAYERS: UInt = 1000;
-
-// GPU Device ID: NVIDIA GTX 1070 Ti = 10de:1b82
-// Hardware Analysis v2.0: Separate Control Plane (BAR 0) from Data Plane (BAR 1)
-const GPU_VENDOR: UInt = 0x10de;
-const GPU_DEVICE: UInt = 0x1b82;
-
-// BAR 0: Control Plane (16MB) - MMIO registers, DMA commands, interrupts
-// DANGER: Do NOT write data here - this is the "cockpit" not the "cargo bay"
-const BAR_CONTROL: UInt = 0;
-const BAR_CONTROL_SIZE: UInt = 0x1000000;  // 16MB
-
-// BAR 1: Data Plane (256MB) - Linear VRAM aperture for weight streaming
-// SAFE: This is the "cargo bay" - we can safely stream data here
-const BAR_DATA: UInt = 1;
-const BAR_DATA_SIZE: UInt = 0x10000000;  // 256MB (aperture window)
+// MAX_LAYERS imported from kernel.dbv
 
 // --- Init: V.I.T. (Visita Interiora Terrae) ---
 // Hardware Analysis v2.0: Map both Control Plane (BAR 0) and Data Plane (BAR 1)

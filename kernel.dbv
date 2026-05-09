@@ -1,0 +1,58 @@
+// Kernel FFI Bindings for VITRIOL
+// Phase 1: Basic PCI operations
+// Phase 2+: DMA engine and hardware introspection
+
+// Print function (variadic - use wrapper in practice)
+ffi printk(fmt: String) -> Int;
+
+// PCI device discovery
+ffi pci_get_device(vendor: UInt, device: UInt, from: UInt) -> UInt;
+
+// BAR mapping
+ffi pci_iomap(dev: UInt, bar: UInt, len: UInt) -> UInt;
+ffi pci_iounmap(dev: UInt, addr: UInt) -> Bool;
+ffi pci_dev_put(dev: UInt) -> Bool;
+
+// BAR resource queries (for hardware discovery)
+ffi pci_resource_len(dev: UInt, bar: UInt) -> UInt;
+ffi pci_resource_start(dev: UInt, bar: UInt) -> UInt;
+
+// DMA memory allocation
+ffi dma_alloc_coherent(dev: UInt, size: UInt, dma_handle: UInt, flag: UInt) -> UInt;
+ffi dma_free_coherent(dev: UInt, size: UInt, cpu_addr: UInt, dma_handle: UInt);
+
+// DMA mapping (handles IOMMU translation)
+ffi dma_map_single(dev: UInt, addr: UInt, size: UInt, dir: UInt) -> UInt;
+ffi dma_mapping_error(dma_addr: UInt) -> Bool;
+
+// Memory barriers (critical for DMA synchronization)
+ffi mb();     // Full memory barrier
+ffi rmb();    // Read memory barrier
+ffi wmb();    // Write memory barrier
+
+// Pascal-specific DMA engine registers (GP104)
+ffi pfb_bar1_read(offset: UInt) -> UInt;
+ffi pfb_bar1_write(offset: UInt, val: UInt);
+ffi pdma_status() -> UInt;
+ffi pdma_push(src: UInt, dst: UInt, size: UInt);
+
+// Control Plane register access (read-only for monitoring)
+ffi read_reg_at(addr: UInt) -> UInt;
+ffi write_reg_at(addr: UInt, val: UInt);
+
+// Hardware Constants (GP104 GTX 1070 Ti)
+const GPU_VENDOR: UInt = 0x10de;
+const GPU_DEVICE: UInt = 0x1b82;
+const BAR_CONTROL_SIZE: UInt = 0x1000000;   // 16MB (Control Plane)
+const BAR_DATA_SIZE: UInt = 0x10000000;     // 256MB (Data Plane)
+const MAX_LAYERS: UInt = 1000;
+
+// DMA Direction Constants
+const DMA_TO_DEVICE: UInt = 1;
+const DMA_FROM_DEVICE: UInt = 2;
+const DMA_BIDIRECTIONAL: UInt = 3;
+
+// Safety Levels
+const SAFETY_READ_ONLY: UInt = 1;      // Safe: GPU queries only
+const SAFETY_DMA_WRITE: UInt = 2;      // Medium: DMA writes enabled
+const SAFETY_RAW_PCI: UInt = 3;        // High: Raw PCI access
