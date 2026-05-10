@@ -1,294 +1,203 @@
-# VITRIOL - Spatial Transformer for Infinite VRAM
+# VITRIOL - SSD-to-GPU Direct Streaming for Legacy Hardware
 <img src="vitriol_logo.svg" alt="VITRIOL" width="200"/>
 
 *"Visita Interiora Terrae Rectificando Invenies Occultum Lapidem"*
 
 (Visit the Interior of the Earth, by Rectifying you will find the Hidden Stone)
 
+## TL;DR
+
+VITRIOL enables running large language models (like Qwen 3.5 9B) on **legacy hardware** (GTX 1070 Ti + i7-3770) by streaming model weights directly from SSD to GPU VRAM via PCIe DMA, bypassing the slow CPU bottleneck.
+
+---
+
 ## Current Status
 
-**Phase 1: Foundation (Complete)**
-- [x] Stub kernel module (test mode) - PASSED
-- [x] Socket API design
-- [x] Python client library
-- [x] Daemon skeleton
-- [x] KoboldCPP integration via context rectifier shim
-- [x] End-to-end inference test - OPERATIONAL
+| Component | Status | Notes |
+|-----------|--------|-------|
+| llama.cpp + CUDA | ✅ Working | 10.6 tok/s with Qwen 3.5 9B |
+| Kernel Module | ✅ Built | `vitriol-daemon/vitriol.ko` |
+| NVIDIA GDS Analysis | ✅ Done | Source at `/mnt/data/ai/gds-nvidia-fs/` |
+| KTransformers Patterns | ✅ Analyzed | Async double-buffer logic |
+| VITRIOL Modes (flag-based) | ✅ Implemented | async/sync/stream modes |
+| Benchmark Script | ✅ Ready | `benchmark_vitriol.sh` |
+
+---
 
 ## Quick Start
 
-### Phase 1: KoboldCPP + VITRIOL Shim (Stable)
+### Option 1: Baseline (Recommended - Works Now)
 
 ```bash
-# 1. Launch the VITRIOL stack
-./launch_vitriol.sh
+# Start llama-server with CUDA
+cd /mnt/data/ai/llama.cpp
+./bin/llama-server \
+    -m /mnt/data/ai/koboldcpp/Qwen_Qwen3.5-9B-Q4_K_M.gguf \
+    -c 8192 \
+    -ngl 25 \
+    --port 5002
 
-# 2. Test the integration
-python3 test_shim.py
-
-# 3. Point your agent to VITRIOL
-# Configure OpenCode/agent to use: http://localhost:5010/v1/chat/completions
+# Test inference
+curl http://localhost:5002/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":50}'
 ```
 
-### Phase 2+: Kernel Module (Advanced)
+### Option 2: VITRIOL Modes (Flag-Dependent)
 
 ```bash
-# 1. Build kernel module (with stubs for safe testing)
-cd ../brief-compiler && cargo build
-cd ../linux-pipe-module
-rm -f vitriol_new_ffi.c
-./brief-compiler c vitriol_new_ffi.bv --target linux_kernel --test-mode
-make
+# Disabled (baseline)
+VITRIOL_MODE=disabled ./llama-server -m model.gguf -ngl 25
 
-# 2. Load module (stub mode - safe, no real hardware)
-sudo insmod vitriol_new_ffi.ko test_mode=1
+# Sync (preload all to VRAM)
+VITRIOL_MODE=sync ./llama-server -m model.gguf -ngl 25
 
-# 3. Check output
-sudo dmesg | grep VITRIOL
+# Async (KTransformers-style double-buffer)
+VITRIOL_MODE=async VITRIOL_ASYNC_PREFETCH=1 ./llama-server -m model.gguf -ngl 25
 
-# 4. Unload
-sudo rmmod vitriol_new_ffi
+# Stream (on-demand from SSD)
+VITRIOL_MODE=stream ./llama-server -m model.gguf -ngl 15
+
+# Run benchmark comparison
+./benchmark_vitriol.sh
 ```
 
-### Phase 2+: Kernel Module (Advanced)
+---
 
-```bash
-# 1. Build kernel module (with stubs for safe testing)
-cd ../brief-compiler && cargo build
-cd ../linux-pipe-module
-rm -f vitriol_new_ffi.c
-./brief-compiler c vitriol_new_ffi.bv --target linux_kernel --test-mode
-make
+## Hardware Configuration
 
-# 2. Load module (stub mode - safe, no real hardware)
-sudo insmod vitriol_new_ffi.ko test_mode=1
+| Component | Details |
+|-----------|---------|
+| GPU | GTX 1070 Ti (device 1b82, 8GB VRAM) |
+| CPU | i7-3770 (Ivy Bridge, no AVX2) |
+| Storage | NVMe SSD on `/mnt/data/ai` |
+| BAR1 Window | 256MB (VRAM aperture for DMA) |
 
-# 3. Check output
-sudo dmesg | grep VITRIOL
-
-# 4. Unload
-sudo rmmod vitriol_new_ffi
-```
+---
 
 ## Architecture
 
-### Phase 1: Context Rectification (Operational)
+### Current Working Stack
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│              OpenCode / Agent Clients                        │
-│         (sending large contexts)                             │
-└─────────────────────────┬────────────────────────────────────┘
-                          │ HTTP POST /v1/chat/completions
-                          ▼
-┌──────────────────────────────────────────────────────────────┐
-│         VITRIOL Shim (port 5010, Python)                     │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  1. Thermal Poll: nvidia-smi → halt if >85°C           │  │
-│  │  2. Calcination: Drop middle messages, keep last 4     │  │
-│  │  3. Sublimation: Strip <reasoning>, tool_results       │  │
-│  │  4. Coagulation: Enforce 7k token cap                  │  │
-│  └────────────────────────────────────────────────────────┘  │
-│          Output: Rectified context (7k tokens max)           │
-└─────────────────────────┬────────────────────────────────────┘
-                          │ Forward rectified request
-                          ▼
-┌──────────────────────────────────────────────────────────────┐
-│              KoboldCPP (port 5001, CUDA)                     │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  Qwen3.5 9B Q4_K_M (5.5GB)                             │  │
-│  │  GPU Layers: 25-30                                     │  │
-│  │  Context: 4096-8192 tokens                             │  │
-│  └────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
+OpenCode → llama-server (port 5002) → ggml-cuda.cu → GPU VRAM
+                                        ↓
+                    Qwen 3.5 9B Q4_K_M (5.5GB) on SSD
 ```
 
-### Phase 2+: Hardware Acceleration (Planned)
+**Performance:** ~10.6 tokens/second with 25 GPU layers
+
+### Target Architecture (VITRIOL Moore Stream)
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    Python Agent Clients                  │
-│            (LangChain, CrewAI, Custom Agents)            │
-└─────────────────────────┬────────────────────────────────┘
-                          │ Unix Socket (/var/run/vitriol.sock)
+┌─────────────────────────────────────────────────────────────┐
+│                    llama.cpp (modified)                      │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │ VITRIOL Hooks (ggml-cuda.cu line 682)                   │ │
+│  │  - disabled: Standard CUDA memcpy                       │ │
+│  │  - async: Double-buffer prefetch (KTransformers style)  │ │
+│  │  - stream: On-demand SSD→GPU DMA                        │ │
+│  └─────────────────────────────────────────────────────────┘ │
+└─────────────────────────┬───────────────────────────────────┘
+                          │ IOCTL / DMA
                           ▼
-┌──────────────────────────────────────────────────────────┐
-│                    vitriol-daemon (Userspace)            │
-│  ┌─────────────┐  ┌─────────────┐  ┌────────────────────┐│
-│  │   Socket    │  │   llama.cpp │  │   Layer Manager    ││
-│  │   Server    │  │  Inference  │ │   (LRU, Streaming) ││
-│  └─────────────┘  └─────────────┘  └────────────────────┘│
-└─────────────────────────┬────────────────────────────────┘
-                          │ ioctl / Character Device
-                          ▼
-┌──────────────────────────────────────────────────────────┐
-│                    vitriol.ko (Kernel Module)            │
-│  ┌─────────────┐  ┌─────────────┐  ┌────────────────────┐│
-│  │   Safety    │  │     DRM     │  │   DMA Engine       ││
-│  │   Layer     │  │  (nvidia)   │ │  (dmaengine API)   ││
-│  └─────────────┘  └─────────────┘  └────────────────────┘│
-└─────────────────────────┬────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│              vitriol.ko (Kernel Module)                     │
+│  - PCI probe (10de:1b82)                                   │
+│  - BAR0 mapping (16MB control)                             │
+│  - BAR1 mapping (256MB data window)                        │
+│  - DMA buffer allocation                                   │
+└─────────────────────────┬───────────────────────────────────┘
                           │ PCIe
                           ▼
-┌────────────────┐     ┌────────────────┐
-│      SSD       │────▶│   GPU VRAM     │
-│   (Storage)    │ DMA │  (8GB GTX)     │
-└────────────────┘     └────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    NVMe SSD ←→ GPU VRAM                     │
+│              (Direct P2P DMA, no CPU involvement)          │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│              OpenCode / Agent Clients                        │
-│         (sending large contexts)                             │
-└─────────────────────────┬────────────────────────────────────┘
-                          │ HTTP POST /v1/chat/completions
-                          ▼
-┌──────────────────────────────────────────────────────────────┐
-│         VITRIOL Shim (port 5010, Python)                     │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  1. Thermal Poll: nvidia-smi → halt if >85°C           │  │
-│  │  2. Calcination: Drop middle messages, keep last 4     │  │
-│  │  3. Sublimation: Strip <reasoning>, tool_results       │  │
-│  │  4. Coagulation: Enforce 7k token cap                  │  │
-│  └────────────────────────────────────────────────────────┘  │
-│          Output: Rectified context (7k tokens max)           │
-└─────────────────────────┬────────────────────────────────────┘
-                          │ Forward rectified request
-                          ▼
-┌──────────────────────────────────────────────────────────────┐
-│              KoboldCPP (port 5001, CUDA)                     │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  Qwen3.5 9B Q4_K_M (5.5GB)                             │  │
-│  │  GPU Layers: 25-30                                     │  │
-│  │  Context: 4096-8192 tokens                             │  │
-│  └────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
-```
+---
 
-### Phase 2+: Hardware Acceleration (Planned)
+## Key Files
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    Python Agent Clients                  │
-│            (LangChain, CrewAI, Custom Agents)            │
-└─────────────────────────┬────────────────────────────────┘
-                          │ Unix Socket (/var/run/vitriol.sock)
-                          ▼
-┌──────────────────────────────────────────────────────────┐
-│                    vitriol-daemon (Userspace)            │
-│  ┌─────────────┐  ┌─────────────┐  ┌────────────────────┐│
-│  │   Socket    │  │   llama.cpp │  │   Layer Manager    ││
-│  │   Server    │  │  Inference  │ │   (LRU, Streaming) ││
-│  └─────────────┘  └─────────────┘  └────────────────────┘│
-└─────────────────────────┬────────────────────────────────┘
-                          │ ioctl / Character Device
-                          ▼
-┌──────────────────────────────────────────────────────────┐
-│                    vitriol.ko (Kernel Module)            │
-│  ┌─────────────┐  ┌─────────────┐  ┌────────────────────┐│
-│  │   Safety    │  │     DRM     │  │   DMA Engine       ││
-│  │   Layer     │  │  (nvidia)   │ │  (dmaengine API)   ││
-│  └─────────────┘  └─────────────┘  └────────────────────┘│
-└─────────────────────────┬────────────────────────────────┘
-                          │ PCIe
-                          ▼
-┌────────────────┐     ┌────────────────┐
-│      SSD       │────▶│   GPU VRAM     │
-│   (Storage)    │ DMA │  (8GB GTX)     │
-└────────────────┘     └────────────────┘
-```
+| Path | Description |
+|------|-------------|
+| `/mnt/data/ai/llama.cpp/bin/llama-server` | CUDA inference server (9.5MB) |
+| `/mnt/data/ai/llama.cpp/bin/libggml-cuda.so` | CUDA backend (74MB) |
+| `/mnt/data/ai/koboldcpp/Qwen_Qwen3.5-9B-Q4_K_M.gguf` | Model (5.5GB) |
+| `vitriol-daemon/vitriol.ko` | Kernel module (410KB) |
+| `vitriol-daemon/vitriol-util` | Userspace utility |
+| `include/vitriol-config.h` | Mode configuration |
+| `ggml/src/ggml-cuda/vitriol-cuda-integration.cpp` | CUDA hooks |
 
-## Safety Levels
+---
 
-| Level | Operations | Risk |
-|-------|-------------|------|
-| `safety_level=1` | Read-only GPU queries, DRM copy | **LOW** |
-| `safety_level=2` | + DMA writes (opt-in) | **MEDIUM** |
-| `safety_level=3` | + Raw PCI access | **HIGH** |
+## Key Insights from NVIDIA GDS & KTransformers
 
-**Default**: `safety_level=1` (read-only, safe)
+### NVIDIA GDS (GPUDirect Storage)
+- Source: `/mnt/data/ai/gds-nvidia-fs/src/nvfs-core.c`
+- Uses `kiocb` completion callbacks for NVMe
+- Shared "metapage" for fast completion signaling
+- Memory barriers (`wmb()`) before DMA
 
-## Socket API
+### KTransformers (Async Scheduling)
+- YAML-based layer placement (for Alembic Substrate)
+- Double-buffer prefetch: compute layer N while streaming N+1
+- Arithmetic intensity: Attention→GPU, MoE→CPU/SSD
 
-Connect to `/var/run/vitriol.sock`:
+---
 
-```bash
-# Status check
-python -c "
-from libvitriol import VitriolClient
-with VitriolClient() as c:
-    print(c.get_status())
-"
-```
+## KTransformers Comparison
 
-## Testing
+| Aspect | KTransformers | VITRIOL |
+|--------|---------------|---------|
+| Hot Path | CPU math (AMX/AVX512) | GPU (CUDA) |
+| Cold Path | GPU (minimal) | NVMe DMA |
+| CPU Role | Compute MoE experts | Orchestration only |
+| Target | Modern Xeon (400GB/s) | Legacy Ivy Bridge |
+| **VITRIOL Advantage** | - | Bypasses CPU entirely |
 
-**IMPORTANT**: Always test in stub mode first:
+---
 
-```bash
-# Safe stub test
-sudo insmod vitriol_new_ffi.ko test_mode=1
-sudo dmesg | grep VITRIOL
-sudo rmmod vitriol_new_ffi
-```
-
-## Files
+## Documentation Files
 
 | File | Purpose |
 |------|---------|
-| `vitriol_shim.py` | **Phase 1**: KoboldCPP context rectifier proxy |
-| `launch_vitriol.sh` | **Phase 1**: Unified launch script |
-| `vitriol_new_ffi.bv` | **Phase 2+**: Brief source (kernel module) |
-| `vitriol-daemon/` | **Phase 2+**: Rust daemon (socket server) |
-| `libvitriol/` | Python client library |
-| `test_shim.py` | **Phase 1**: Integration test suite |
-| `test_vitriol.sh` | **Phase 2+**: Kernel module test harness |
-| `VITRIOL_IMPLEMENTATION_PLAN.md` | Complete 4-phase implementation plan |
-| `PHASE1_COMPLETE.md` | Phase 1 operational status |
+| `PROJECT_STATUS.md` | Full project status |
+| `SESSION_SUMMARY.md` | Session-by-session summary |
+| `NVIDIA_GDS_INFO.md` | GDS source analysis |
+| `NVIDIA_OPENSOURCE_TREASURES.md` | NVIDIA repos (gds-nvidia-fs, open-gpu-kernel-modules, hw-nvdla) |
+| `KTRANSFORMERS_ANALYSIS.md` | Async scheduling analysis |
+| `VITRIOL_MOORE_STREAM_IMPLEMENTATION.md` | DMA implementation plan |
 
-## Dependencies
+---
 
-### Phase 1 (KoboldCPP Shim)
-- Python 3.8+
-- Flask (`pip3 install flask requests`)
-- KoboldCPP
-- CUDA-capable GPU (NVIDIA with 8GB+ VRAM recommended)
+## Next Steps
 
-### Phase 2+ (Kernel Module)
-- Linux kernel headers (6.x)
-- Rust (for daemon)
-- Brief compiler (../brief-compiler)
-- CUDA/llama.cpp (for inference)
+1. **Load kernel module on target system:**
+   ```bash
+   sudo insmod vitriol-daemon/vitriol.ko
+   dmesg | tail
+   ```
 
-## Model
+2. **Test VITRIOL modes:**
+   ```bash
+   ./benchmark_vitriol.sh
+   ```
 
-**Recommended:** Qwen3.5 9B Q4_K_M (~5.5GB)
+3. **Implement true NVMe→GPU DMA:**
+   - Integrate kernel module with llama.cpp
+   - Implement sliding window for 256MB BAR1 limit
+   - Add metapage completion signaling
 
-Download to a location of your choice:
-```bash
-huggingface-cli download Qwen/Qwen3.5-9B-Instruct-GGUF \
-  --include "qwen3.5-9b-instruct-q4_k_m.gguf" \
-  --local-dir ~/models/
-```
+---
 
-Update paths in:
-- `launch_vitriol.sh` (KoboldCPP `--model` parameter)
-- `run_qwen.sh` (if using separate launch script)
+## References
 
-## Safety Notes
+- NVIDIA GDS: https://github.com/NVIDIA/gds-nvidia-fs
+- KTransformers: https://github.com/kvcache-ai/KTransformers
+- llama.cpp: https://github.com/ggml-org/llama.cpp
 
-### Phase 1 (Shim) - SAFE
-- Pure Python userspace code
-- No hardware access
-- Thermal monitoring via `nvidia-smi` (read-only)
-- Can be safely tested on any system with KoboldCPP
+---
 
-### Phase 2+ (Kernel Module) - ADVANCED
-- This machine is primary driver - HIGH CAUTION
-- Never use `safety_level=3` without backup
-- Test incrementally: each phase before advancing
-- Check `dmesg` after each operation
-- Always start with `test_mode=1` (stub mode)
-- Use iGPU for display when testing hardware access
-- Always start with `test_mode=1` (stub mode)
-- Use iGPU for display when testing hardware access
+*VITRIOL: Turning the Fever Dream into Engineering Reality*
