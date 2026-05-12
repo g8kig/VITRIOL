@@ -1,203 +1,165 @@
-# VITRIOL - SSD-to-GPU Direct Streaming for Legacy Hardware
+# VITRIOL
+
 <img src="vitriol_logo.svg" alt="VITRIOL" width="200"/>
 
 *"Visita Interiora Terrae Rectificando Invenies Occultum Lapidem"*
 
 (Visit the Interior of the Earth, by Rectifying you will find the Hidden Stone)
 
-## TL;DR
+## What It Is
 
-VITRIOL enables running large language models (like Qwen 3.5 9B) on **legacy hardware** (GTX 1070 Ti + i7-3770) by streaming model weights directly from SSD to GPU VRAM via PCIe DMA, bypassing the slow CPU bottleneck.
+VITRIOL runs large language models on **VRAM-constrained hardware** by streaming only the active MoE experts from disk to GPU, instead of loading the full model. The model never fully sits in memory.
 
----
+**Current approach:** llama.cpp's `-ot` flag keeps 256 experts on CPU while embedding + attention layers run on GPU. This fits a 35B model in 775MB of VRAM.
 
-## Current Status
+**Target approach:** Direct NVMe→GPU DMA via PCIe P2P (`vitriol.ko` kernel module), orchestrated by the Alka language, for sub-millisecond expert swapping.
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| llama.cpp + CUDA | ✅ Working | 10.6 tok/s with Qwen 3.5 9B |
-| Kernel Module | ✅ Built | `vitriol-daemon/vitriol.ko` |
-| NVIDIA GDS Analysis | ✅ Done | Source at `/mnt/data/ai/gds-nvidia-fs/` |
-| KTransformers Patterns | ✅ Analyzed | Async double-buffer logic |
-| VITRIOL Modes (flag-based) | ✅ Implemented | async/sync/stream modes |
-| Benchmark Script | ✅ Ready | `benchmark_vitriol.sh` |
+**Origin:** Built and optimized on a GTX 1070 Ti (Pascal, 8GB) + i7-3770 (Ivy Bridge). The architecture generalizes to any hardware where VRAM is the bottleneck.
 
 ---
 
-## Quick Start
+## Current Architecture
 
-### Option 1: Baseline (Recommended - Works Now)
+```
+Model: Qwen3.6-35B-A3B (256 experts, 8 active/token, 2-bit quant)
+         │
+         ▼
+┌─────────────────────┐       ┌─────────────────────┐
+│     GPU (775MB)     │       │   CPU/Host (10.6GB)   │
+│  Embeddings + Attn  │       │   All 256 experts     │
+│  20/41 layers       │       │   (on-demand loading) │
+└─────────────────────┘       └─────────────────────┘
+```
+
+**Key constraint:** GPU VRAM is 8GB. Full model is 8.8GB. Solution: don't load all 256 experts — only 8 are active per token.
+
+---
+
+## Target Architecture
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│   Alka (Orchestration)                                        │
+│   FLOW = load expert, SHIFT = slide BAR1 window               │
+├───────────────────────────────────────────────┬───────────────┤
+│   llama.cpp (Inference)                       │ VITRIOL (DMA) │
+│   Tokenization, KV cache, attention compute  │ vitriol.ko    │
+│                                                │ NVMe→GPU P2P  │
+├───────────────────────┬───────────────────────┴───────────────┤
+│     GPU (8GB)         │      SSD (NVMe)                       │
+│  Base model (always)  │   256 experts (1 at a time)            │
+│  Active experts (swapped)│  12GB GGUF file                     │
+└───────────────────────┴───────────────────────────────────────┘
+```
+
+---
+
+## Hardware (Development Platform)
+
+| Component | Model |
+|-----------|-------|
+| GPU (primary) | GTX 1070 Ti (Pascal, 8GB, device 1b82) |
+| CPU | i7-3770 (Ivy Bridge, no AVX2) |
+| GPU (secondary) | GTX 960 (2GB) — future draft model / speculative decoding |
+| Storage | NVMe SSD |
+
+## Model: Qwen3.6-35B-A3B
+
+| Metric | Value |
+|--------|-------|
+| Architecture | MoE, 256 experts, 8 active/token |
+| Total params | 34.66 B |
+| Active per token | ~3B (8/256 experts) |
+| Quantization | UD-Q2_K_XL (2-bit) |
+| File size | 11.44 GiB |
+
+---
+
+## Running It
 
 ```bash
-# Start llama-server with CUDA
-cd /mnt/data/ai/llama.cpp
-./bin/llama-server \
-    -m /mnt/data/ai/koboldcpp/Qwen_Qwen3.5-9B-Q4_K_M.gguf \
-    -c 8192 \
-    -ngl 25 \
+# Embeddings + attention on GPU, 256 experts on CPU
+CUDA_VISIBLE_DEVICES=0 /mnt/data/ai/llama.cpp/bin/llama-server \
+    -m /mnt/data/ai/koboldcpp/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf \
+    -ngl 20 \
+    -ot ".*exps.*=CPU" \
     --port 5002
 
-# Test inference
 curl http://localhost:5002/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":50}'
-```
-
-### Option 2: VITRIOL Modes (Flag-Dependent)
-
-```bash
-# Disabled (baseline)
-VITRIOL_MODE=disabled ./llama-server -m model.gguf -ngl 25
-
-# Sync (preload all to VRAM)
-VITRIOL_MODE=sync ./llama-server -m model.gguf -ngl 25
-
-# Async (KTransformers-style double-buffer)
-VITRIOL_MODE=async VITRIOL_ASYNC_PREFETCH=1 ./llama-server -m model.gguf -ngl 25
-
-# Stream (on-demand from SSD)
-VITRIOL_MODE=stream ./llama-server -m model.gguf -ngl 15
-
-# Run benchmark comparison
-./benchmark_vitriol.sh
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":30}'
 ```
 
 ---
 
-## Hardware Configuration
-
-| Component | Details |
-|-----------|---------|
-| GPU | GTX 1070 Ti (device 1b82, 8GB VRAM) |
-| CPU | i7-3770 (Ivy Bridge, no AVX2) |
-| Storage | NVMe SSD on `/mnt/data/ai` |
-| BAR1 Window | 256MB (VRAM aperture for DMA) |
-
----
-
-## Architecture
-
-### Current Working Stack
+## Project Structure
 
 ```
-OpenCode → llama-server (port 5002) → ggml-cuda.cu → GPU VRAM
-                                        ↓
-                    Qwen 3.5 9B Q4_K_M (5.5GB) on SSD
-```
-
-**Performance:** ~10.6 tokens/second with 25 GPU layers
-
-### Target Architecture (VITRIOL Moore Stream)
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    llama.cpp (modified)                      │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │ VITRIOL Hooks (ggml-cuda.cu line 682)                   │ │
-│  │  - disabled: Standard CUDA memcpy                       │ │
-│  │  - async: Double-buffer prefetch (KTransformers style)  │ │
-│  │  - stream: On-demand SSD→GPU DMA                        │ │
-│  └─────────────────────────────────────────────────────────┘ │
-└─────────────────────────┬───────────────────────────────────┘
-                          │ IOCTL / DMA
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│              vitriol.ko (Kernel Module)                     │
-│  - PCI probe (10de:1b82)                                   │
-│  - BAR0 mapping (16MB control)                             │
-│  - BAR1 mapping (256MB data window)                        │
-│  - DMA buffer allocation                                   │
-└─────────────────────────┬───────────────────────────────────┘
-                          │ PCIe
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    NVMe SSD ←→ GPU VRAM                     │
-│              (Direct P2P DMA, no CPU involvement)          │
-└─────────────────────────────────────────────────────────────┘
+├── ARCHITECTURE_HISTORY.md    # Design evolution, decisions, dead ends
+├── docs/
+│   ├── TESTING_PLAN.md        # Benchmarks, component tests
+│   ├── VITRIOL_ARCHITECTURE.md
+│   └── VITRIOL_IMPLEMENTATION_PLAN.md
+├── vitriol-daemon/
+│   └── vitriol.ko             # Kernel module (P2P DMA, untested)
+├── include/
+│   ├── vitriol-moe-expert-parser.h   # Expert tensor parsing
+│   └── vitriol-expert-cache.h        # LRU cache for expert loading
+└── src/
+    ├── vitriol-moe-expert-parser.cpp
+    └── vitriol-expert-cache.cpp
 ```
 
 ---
 
-## Key Files
+## Ars Priori & Acknowledgements
 
-| Path | Description |
-|------|-------------|
-| `/mnt/data/ai/llama.cpp/bin/llama-server` | CUDA inference server (9.5MB) |
-| `/mnt/data/ai/llama.cpp/bin/libggml-cuda.so` | CUDA backend (74MB) |
-| `/mnt/data/ai/koboldcpp/Qwen_Qwen3.5-9B-Q4_K_M.gguf` | Model (5.5GB) |
-| `vitriol-daemon/vitriol.ko` | Kernel module (410KB) |
-| `vitriol-daemon/vitriol-util` | Userspace utility |
-| `include/vitriol-config.h` | Mode configuration |
-| `ggml/src/ggml-cuda/vitriol-cuda-integration.cpp` | CUDA hooks |
+VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe, metapage completion signaling, async expert prefetching, extreme quantization on legacy hardware — was reverse-engineered from the following works. We document our debt explicitly.
 
----
+### Inference Engine
 
-## Key Insights from NVIDIA GDS & KTransformers
+| Project | What We Learned |
+|---------|-----------------|
+| **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (ggml-org) | The core inference engine. GGUF format, CUDA backend, tensor loading pipeline. The `-ot` (override tensor) flag in PR #11397 was the breakthrough that enabled expert streaming. Our `vitriol-cuda-integration.cpp` hooks into `ggml-cuda.cu` at the tensor-copy boundary. |
+| **[GGUF Format](https://github.com/ggerganov/llama.cpp/blob/master/ggml/include/gguf.h)** | Binary model format with tensor offsets accessible via `gguf_get_tensor_offset()`, `gguf_get_tensor_name()`, `gguf_get_tensor_type()` — the foundation of our expert parser. |
+| **[PR #11397](https://github.com/ggerganov/llama.cpp/pull/11397)** (slaren) | Added `--override-tensor` (`-ot`) for per-tensor-type buffer placement. The exact mechanism we use: `-ot ".*exps.*=CPU"` keeps 8GB of experts on CPU while attention layers run on GPU. |
+| **[PR #11571](https://github.com/ggerganov/llama.cpp/pull/11571)** (fairydreaming) | Load-all-experts-during-warmup; `llama_set_warmup()` API for ensuring all expert tensors are resident before inference. |
+| **[PR #6387](https://github.com/ggerganov/llama.cpp/pull/6387)** (slaren) | Changed expert storage from per-expert tensors to a single 3D tensor — critical for our approach since all 256 experts are now in one contiguous block. |
 
-### NVIDIA GDS (GPUDirect Storage)
-- Source: `/mnt/data/ai/gds-nvidia-fs/src/nvfs-core.c`
-- Uses `kiocb` completion callbacks for NVMe
-- Shared "metapage" for fast completion signaling
-- Memory barriers (`wmb()`) before DMA
+### GPUDirect Storage & DMA
 
-### KTransformers (Async Scheduling)
-- YAML-based layer placement (for Alembic Substrate)
-- Double-buffer prefetch: compute layer N while streaming N+1
-- Arithmetic intensity: Attention→GPU, MoE→CPU/SSD
+| Project | What We Learned |
+|---------|-----------------|
+| **[gds-nvidia-fs](https://github.com/NVIDIA/gds-nvidia-fs)** (NVIDIA) | Official GPUDirect Storage source code. We studied `nvfs-core.c`, `nvfs-pci.c`, and `nvfs-dma.c` to understand: kiocb completion callbacks for NVMe, shared metapage (4KB) for fast completion signaling, `wmb()` memory barriers before DMA. |
+| **[open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules)** (NVIDIA) | NVIDIA's open kernel module source for PCIe register-level operations — reference for understanding BAR mapping and GPU PCI config space. |
+| **[hw-nvdla](https://github.com/NVIDIA/hw-nvdla)** (NVIDIA) | Hardware DLA documentation for understanding direct memory access patterns on NVIDIA silicon. |
 
----
+### Async Scheduling & MoE Orchestration
 
-## KTransformers Comparison
+| Project | What We Learned |
+|---------|-----------------|
+| **[KTransformers](https://github.com/kvcache-ai/KTransformers)** (kvcache-ai) | YAML-based layer placement across CPU/GPU, double-buffer prefetch pattern (compute layer N while streaming N+1), MoE-specific async scheduling. KTransformers targets modern CPUs (AMX/AVX512); VITRIOL inverts this — GPU as primary compute, CPU as orchestrator only. |
+| **Qwen3.6-35B-A3B MoE** | 256 experts, 8 active per token — the exact sparsity architecture that makes expert streaming viable. The MoE router (`ffn_gate_inp`) determines which 8 experts to load; only those need to be in VRAM. |
 
-| Aspect | KTransformers | VITRIOL |
-|--------|---------------|---------|
-| Hot Path | CPU math (AMX/AVX512) | GPU (CUDA) |
-| Cold Path | GPU (minimal) | NVMe DMA |
-| CPU Role | Compute MoE experts | Orchestration only |
-| Target | Modern Xeon (400GB/s) | Legacy Ivy Bridge |
-| **VITRIOL Advantage** | - | Bypasses CPU entirely |
+### Extreme Quantization & Compute
 
----
+| Project | What We Learned |
+|---------|-----------------|
+| **[3LTERN](https://github.com/ELX987/3LTERN)** (ELX987) | W1.58A8 (1.58-bit ternary) CUDA kernel for Pascal. 16 weights packed per uint32, branchless decode via `bit0 - bit1`, `__dp4a` instruction on sm_61. Future optimization path for compute-bound layers. |
+| **[Unsloth](https://huggingface.co/unsloth)** (Daniel & Michael) | Dynamic quantization formats (UD-Q2_K_XL) that are structurally superior to raw 1.58-bit. Ungated model distribution — their Qwen 3.6 releases don't require HF authentication. The model we target was quantized and distributed by them. |
 
-## Documentation Files
-
-| File | Purpose |
-|------|---------|
-| `PROJECT_STATUS.md` | Full project status |
-| `SESSION_SUMMARY.md` | Session-by-session summary |
-| `NVIDIA_GDS_INFO.md` | GDS source analysis |
-| `NVIDIA_OPENSOURCE_TREASURES.md` | NVIDIA repos (gds-nvidia-fs, open-gpu-kernel-modules, hw-nvdla) |
-| `KTRANSFORMERS_ANALYSIS.md` | Async scheduling analysis |
-| `VITRIOL_MOORE_STREAM_IMPLEMENTATION.md` | DMA implementation plan |
+See `ARCHITECTURE_HISTORY.md` for the complete evolution.
 
 ---
 
-## Next Steps
+## Philosophy
 
-1. **Load kernel module on target system:**
-   ```bash
-   sudo insmod vitriol-daemon/vitriol.ko
-   dmesg | tail
-   ```
+**VITRIOL = Engine.** Raw DMA power. Hard-coded, dangerous, fast.
 
-2. **Test VITRIOL modes:**
-   ```bash
-   ./benchmark_vitriol.sh
-   ```
+**Alka = ECU.** Abstraction layer. Safe, repeatable, multi-device.
 
-3. **Implement true NVMe→GPU DMA:**
-   - Integrate kernel module with llama.cpp
-   - Implement sliding window for 256MB BAR1 limit
-   - Add metapage completion signaling
+Build the engine first. Let the friction prove why you need the computer.
 
 ---
 
-## References
-
-- NVIDIA GDS: https://github.com/NVIDIA/gds-nvidia-fs
-- KTransformers: https://github.com/kvcache-ai/KTransformers
-- llama.cpp: https://github.com/ggml-org/llama.cpp
-
----
-
-*VITRIOL: Turning the Fever Dream into Engineering Reality*
+*"Visita Interiora Terrae Rectificando Invenies Occultum Lapidem"*

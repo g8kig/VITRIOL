@@ -8,8 +8,12 @@ MODEL_PATH="/mnt/data/ai/koboldcpp/Qwen_Qwen3.5-9B-Q4_K_M.gguf"
 LLAMA_SERVER="/mnt/data/ai/llama.cpp/bin/llama-server"
 PORT_BASE=5000
 
+# Only use GTX 1070 Ti (device 0), ignore GTX 960
+export CUDA_VISIBLE_DEVICES=0
+
 echo "=== VITRIOL Benchmark Suite ==="
 echo "Model: $MODEL_PATH"
+echo "Using GPU: GTX 1070 Ti only (CUDA_VISIBLE_DEVICES=0)"
 echo ""
 
 # Function to run a test
