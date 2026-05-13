@@ -24,7 +24,7 @@
 | GPU (main) | GTX 1070 Ti (8GB, Pascal sm_61) | Primary inference |
 | GPU (secondary) | GTX 960 (2GB) | Future draft model for speculative decoding |
 | CPU | i7-3770 (Ivy Bridge, no AVX2) | Orchestration only (too slow for compute) |
-| Storage | NVMe SSD at `/mnt/data/ai/` | Models, swap, temp |
+| Storage | NVMe SSD | Models, swap, temp |
 | RAM | 16GB (dedicated swap file for safety) | |
 
 ---
@@ -59,7 +59,9 @@ See `ARCHITECTURE_HISTORY.md` for full details.
 
 ## 5. Files
 
-### Core Project (at `/home/randozart/Desktop/Projects/VITRIOL/`)
+All paths are configured via environment variables. See `RESOURCE_LOCATIONS.md` for the full mapping and `vitriol.env.example` for defaults.
+
+### Core Project
 
 | File | Purpose |
 |------|---------|
@@ -91,27 +93,26 @@ See `ARCHITECTURE_HISTORY.md` for full details.
 
 | File | Purpose |
 |------|---------|
-| `/mnt/data/ai/llama.cpp/bin/llama-server` | Working inference server |
-| `/mnt/data/ai/llama.cpp/bin/libggml-cuda.so` | CUDA backend (74MB) |
-| `/mnt/data/ai/llama.cpp/ggml/src/ggml-cuda/vitriol-cuda-integration.cpp` | VITRIOL hooks (stubs) |
-| `/mnt/data/ai/llama.cpp/include/vitriol-config.h` | Mode configuration |
-| `/mnt/data/ai/llama.cpp/src/vitriol-config.cpp` | Config implementation |
+| `${VITRIOL_LLAMA_SERVER}` | Working inference server |
+| `${VITRIOL_LLAMA_DIR}/build/bin/libggml-cuda.so` | CUDA backend (74MB) |
+| `${VITRIOL_LLAMA_DIR}/ggml/src/ggml-cuda/vitriol-cuda-integration.cpp` | VITRIOL hooks (stubs) |
+| `${VITRIOL_LLAMA_DIR}/include/vitriol-config.h` | Mode configuration |
+| `${VITRIOL_LLAMA_DIR}/src/vitriol-config.cpp` | Config implementation |
 
 ### Models
 
 | File | Size |
 |------|------|
-| `/mnt/data/ai/koboldcpp/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` | 12.3 GB |
-| `/mnt/data/ai/koboldcpp/Qwen_Qwen3.5-9B-Q4_K_M.gguf` | 5.48 GB |
+| `${VITRIOL_MODEL_DIR}/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf` | 12.3 GB |
+| `${VITRIOL_MODEL_DIR}/Qwen_Qwen3.5-9B-Q4_K_M.gguf` | 5.48 GB |
 
 ### Other References
 
 | Path | Contents |
 |------|----------|
-| `/mnt/data/ai/gds-nvidia-fs/` | NVIDIA GDS source for DMA patterns |
-| `/mnt/data/ai/KTransformers/` | KTransformers async scheduling patterns |
-| `/home/randozart/Desktop/Projects/brief-compiler/` | Brief compiler (related tool) |
-| `/home/randozart/Desktop/Projects/alka-lang/SPECv4.md` | Alka spec (~1900 lines) |
+| `${VITRIOL_EXT_DIR}/gds-nvidia-fs/` | NVIDIA GDS source for DMA patterns |
+| `${VITRIOL_EXT_DIR}/KTransformers/` | KTransformers async scheduling patterns |
+| Alka spec v4 | See `RESOURCE_LOCATIONS.md` for location |
 
 ---
 
@@ -120,18 +121,20 @@ See `ARCHITECTURE_HISTORY.md` for full details.
 ### Run Qwen3.6-35B-A3B (Working — Verified 2026-05-11)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 /mnt/data/ai/llama.cpp/bin/llama-server \
-    -m /mnt/data/ai/koboldcpp/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf \
+source vitriol.env
+
+CUDA_VISIBLE_DEVICES="${VITRIOL_GPU:-0}" "$VITRIOL_LLAMA_SERVER" \
+    -m "$VITRIOL_MODEL_DIR/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf" \
     -ngl 20 \
     -ot ".*exps.*=CPU" \
-    --port 8279 \
+    --port "${VITRIOL_PORT:-8279}" \
     --no-mmap &
 
 # Wait ~90s for 12GB model to fully load and warm up
 sleep 90
 
 # Test inference
-curl http://localhost:8279/v1/chat/completions \
+curl http://localhost:${VITRIOL_PORT:-8279}/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":30}'
 ```
@@ -146,26 +149,29 @@ curl http://localhost:8279/v1/chat/completions \
 ### Run Baseline (Qwen 3.5 9B)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 /mnt/data/ai/llama.cpp/bin/llama-server \
-    -m /mnt/data/ai/koboldcpp/Qwen_Qwen3.5-9B-Q4_K_M.gguf \
+source vitriol.env
+
+CUDA_VISIBLE_DEVICES="${VITRIOL_GPU:-0}" "$VITRIOL_LLAMA_SERVER" \
+    -m "$VITRIOL_MODEL_DIR/Qwen_Qwen3.5-9B-Q4_K_M.gguf" \
     -ngl 25 \
-    --port 8279 \
+    --port "${VITRIOL_PORT:-8279}" \
     --no-mmap
 ```
 
 ### Benchmark
 
 ```bash
-cd /home/randozart/Desktop/Projects/VITRIOL
-CUDA_VISIBLE_DEVICES=0 ./benchmark_vitriol.sh
+source vitriol.env
+cd "$VITRIOL_ROOT"
+CUDA_VISIBLE_DEVICES="${VITRIOL_GPU:-0}" ./benchmark_vitriol.sh
 ```
 
-**Note:** Benchmark script needs `CUDA_VISIBLE_DEVICES=0` set inside it (currently relies on default which may include GTX 960, causing OOM).
+**Note:** Benchmark script needs `CUDA_VISIBLE_DEVICES` set to the primary GPU (currently relies on default which may include GTX 960, causing OOM).
 
 ### Build llama.cpp
 
 ```bash
-cd /mnt/data/ai/llama.cpp
+cd "$VITRIOL_LLAMA_DIR"
 mkdir -p build && cd build
 cmake .. -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 make -j4
@@ -270,9 +276,10 @@ This session was interrupted **mid-test**. Here's exactly where we were:
 ### Step 1: Complete the -\`ot\` Inference Test
 The Qwen3.6-35B-A3B model loaded successfully at 775MB VRAM, but curl hit a 503 during warmup. Retry:
 ```bash
+source vitriol.env
 # Wait for warmup to finish, then test
 sleep 30
-curl http://localhost:8279/v1/chat/completions \
+curl http://localhost:${VITRIOL_PORT:-8279}/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":30}'
 ```
@@ -281,7 +288,8 @@ curl http://localhost:8279/v1/chat/completions \
 ### Step 2: Run Full Benchmark
 Once step 1 confirms inference works:
 ```bash
-CUDA_VISIBLE_DEVICES=0 cd /home/randozart/Desktop/Projects/VITRIOL && ./benchmark_vitriol.sh
+source vitriol.env
+cd "$VITRIOL_ROOT" && CUDA_VISIBLE_DEVICES="${VITRIOL_GPU:-0}" ./benchmark_vitriol.sh
 ```
 Compare tok/s of 35B MoE (experts on CPU) vs 9B dense (all layers on GPU).
 
@@ -302,6 +310,7 @@ Based on profiling:
 ## 12. References
 
 See `README.md` bibliography section for full prior art list.
+See `RESOURCE_LOCATIONS.md` for all external resource paths and environment variable mappings.
 
 ### Critical Links
 - llama.cpp: https://github.com/ggml-org/llama.cpp
@@ -309,7 +318,7 @@ See `README.md` bibliography section for full prior art list.
 - NVIDIA GDS: https://github.com/NVIDIA/gds-nvidia-fs
 - KTransformers: https://github.com/kvcache-ai/KTransformers
 - Qwen3.6-35B-A3B: https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF
-- Alka spec v4: `/home/randozart/Desktop/Projects/alka-lang/SPECv4.md`
+- Alka spec v4: See `RESOURCE_LOCATIONS.md`
 
 ---
 

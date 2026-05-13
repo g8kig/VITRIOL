@@ -1,10 +1,16 @@
 # VITRIOL
 
-<img src="vitriol_logo.svg" alt="VITRIOL" width="200"/>
+<img src="assets/vitriol_logo.svg" alt="VITRIOL" width="200"/>
 
 *"Visita Interiora Terrae Rectificando Invenies Occultum Lapidem"*
 
 (Visit the Interior of the Earth, by Rectifying you will find the Hidden Stone)
+
+---
+
+<img src="assets/alka-logo.svg" alt="Alka" width="100"/>
+
+Powered by **Alka**
 
 ## What It Is
 
@@ -78,30 +84,48 @@ Model: Qwen3.6-35B-A3B (256 experts, 8 active/token, 2-bit quant)
 ## Running It
 
 ```bash
+# Source environment (or set variables manually)
+source vitriol.env
+
 # Embeddings + attention on GPU, 256 experts on CPU
-CUDA_VISIBLE_DEVICES=0 /mnt/data/ai/llama.cpp/bin/llama-server \
-    -m /mnt/data/ai/koboldcpp/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf \
+CUDA_VISIBLE_DEVICES="${VITRIOL_GPU:-0}" "$VITRIOL_LLAMA_SERVER" \
+    -m "$VITRIOL_MODEL_DIR/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf" \
     -ngl 20 \
     -ot ".*exps.*=CPU" \
-    --port 8279
-
-  curl http://localhost:8279/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":30}'
+    --port "${VITRIOL_PORT:-8279}" \
+    --no-mmap \
+    -c 4096
 ```
+
+See `RESOURCE_LOCATIONS.md` for all path configuration and `vitriol.env.example` for defaults.
 
 ---
 
 ## Project Structure
 
 ```
-├── ARCHITECTURE_HISTORY.md    # Design evolution, decisions, dead ends
+├── alka-executor/
+│   ├── executor.c               # Alka stream executor (userspace)
+│   ├── gguf-offset-resolver.c   # GGUF tensor offset parser
+│   └── vitriol_alka_user.h      # Alka ABI header (userspace)
+├── alka/
+│   ├── generated/               # Auto-generated .alka recipes
+│   ├── recipes/                 # Hand-written recipes
+│   ├── vials/                   # Hardware vials (.alkavl)
+│   └── results/                 # Benchmark results
+├── alka-handoff/                # Pre-compiled streams from Alka team
 ├── docs/
-│   ├── TESTING_PLAN.md        # Benchmarks, component tests
-│   ├── VITRIOL_ARCHITECTURE.md
-│   └── VITRIOL_IMPLEMENTATION_PLAN.md
+│   └── ALKA_EXECUTOR_DESIGN.md  # Executor + ABI documentation
+├── scripts/
+│   ├── generate-alka-recipe.sh  # GGUF → .alka recipe generator
+│   ├── benchmark_alka.sh        # Full benchmark pipeline
+│   ├── apply-llama-patches.sh   # Apply VITRIOL patches to llama.cpp
+│   └── build-llama-server.sh    # Build llama.cpp with CUDA
 ├── vitriol-daemon/
-│   └── vitriol.ko             # Kernel module (P2P DMA, untested)
+│   ├── vitriol.c                # Kernel module v0.2 (Alka ABI)
+│   └── vitriol_alka_kernel.h    # Alka ABI header (kernel)
+├── llama.cpp-patches/           # Unified diffs for llama.cpp
+├── llama.cpp/                   # git submodule
 ├── include/
 │   ├── vitriol-moe-expert-parser.h   # Expert tensor parsing
 │   └── vitriol-expert-cache.h        # LRU cache for expert loading

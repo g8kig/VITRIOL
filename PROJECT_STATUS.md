@@ -11,25 +11,27 @@
 |-----------|---------|
 | GPU | GTX 1070 Ti (device 1b82, 8GB VRAM) |
 | CPU | i7-3770 (Ivy Bridge, no AVX2) |
-| Storage | NVMe SSD on /mnt/data/ai |
+| Storage | NVMe SSD |
 | VRAM Window | BAR 1: 256MB aperture |
 
 ---
 
 ## Current Architecture
 
+All paths are configurable via environment variables. See `RESOURCE_LOCATIONS.md` for the full mapping.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Project Files                            │
 ├─────────────────────────────────────────────────────────────┤
-│ /mnt/data/ai/koboldcpp/          - Qwen 3.5 9B model (5.5GB)│
-│ /mnt/data/ai/llama.cpp/bin/      - llama-server + CUDA libs │
-│ /mnt/data/ai/gds-nvidia-fs/src/  - NVIDIA GDS source        │
-│ /mnt/data/ai/swap/               - 16GB swap                │
+│ ${VITRIOL_MODEL_DIR}/        - Model files (GGUF)          │
+│ ${VITRIOL_LLAMA_DIR}/build/  - llama-server + CUDA libs    │
+│ ${VITRIOL_EXT_DIR}/          - External source references   │
+│ swap/                        - Swap file (if needed)        │
 ├─────────────────────────────────────────────────────────────┤
-│ vitriol-daemon/vitriol.ko        - Kernel module (410KB)   │
-│ vitriol-daemon/vitriol-util      - Userspace utility (16KB)│
-│ vitriol_new_ffi.bv              - Brief kernel spec        │
+│ vitriol-daemon/vitriol.ko    - Kernel module (410KB)       │
+│ vitriol-daemon/vitriol-util  - Userspace utility (16KB)    │
+│ vitriol_new_ffi.bv          - Brief kernel spec            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -44,8 +46,9 @@
 - **GPU Memory:** 3974 MiB (model) + 192 MiB (KV) + 565 MiB (compute)
 
 ```bash
-cd /mnt/data/ai/llama.cpp
-./bin/llama-server -m /mnt/data/ai/koboldcpp/Qwen_Qwen3.5-9B-Q4_K_M.gguf -c 8192 -ngl 25 --port 8279
+source vitriol.env
+cd "$VITRIOL_LLAMA_DIR"
+./build/bin/llama-server -m "$VITRIOL_MODEL_DIR/Qwen_Qwen3.5-9B-Q4_K_M.gguf" -c 8192 -ngl 25 --port "${VITRIOL_PORT:-8279}"
 ```
 
 ### 2. NVIDIA GDS Source Analyzed ✅
@@ -73,7 +76,7 @@ cd /mnt/data/ai/llama.cpp
 | `vitriol-daemon/vitriol.ko` | Compiled module (410KB) |
 | `vitriol-daemon/vitriol-util.c` | Userspace utility |
 | `vitriol-daemon/vitriol-util` | Compiled utility |
-| `/mnt/data/ai/llama.cpp/include/vitriol-dma.h` | DMA FFI header |
+| `include/vitriol-dma.h` | DMA FFI header |
 | `NVIDIA_GDS_INFO.md` | GDS analysis notes |
 | `NVIDIA_OPENSOURCE_TREASURES.md` | NVIDIA repos documentation |
 | `VITRIOL_MOORE_STREAM_IMPLEMENTATION.md` | Implementation plan |
@@ -125,6 +128,9 @@ sudo ./vitriol-daemon/vitriol-util bar1
 ## Reference Commands
 
 ```bash
+# Source environment
+source vitriol.env
+
 # Build kernel module
 cd vitriol-daemon && make
 
@@ -140,8 +146,8 @@ sudo ./vitriol-util status
 sudo ./vitriol-util bar1
 
 # Run llama-server
-cd /mnt/data/ai/llama.cpp
-./bin/llama-server -m /mnt/data/ai/koboldcpp/Qwen_Qwen3.5-9B-Q4_K_M.gguf -ngl 25 --port 8279
+cd "$VITRIOL_LLAMA_DIR"
+./build/bin/llama-server -m "$VITRIOL_MODEL_DIR/Qwen_Qwen3.5-9B-Q4_K_M.gguf" -ngl 25 --port "${VITRIOL_PORT:-8279}"
 ```
 
 ---

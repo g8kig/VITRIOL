@@ -1,0 +1,60 @@
+// The Vial: Ivy Bridge + GTX 1070 Ti Configuration
+// Physical constraints that Alka must obey
+
+Vessel GPU_MAIN {
+    PCI_ID: 10de:1b82;
+    NAME: "GTX 1070 Ti";
+
+    Aperture DATA_PLANE {
+        BAR: 1;
+        MAX_WINDOW: 256MB;  // The Z77 trap - cannot map beyond this
+        TYPE: Prefetchable;
+    }
+
+    Aperture CTRL_PLANE {
+        BAR: 0;
+        SIZE: 16MB;
+        TYPE: NonPrefetchable;
+    }
+
+    Thermal SENSOR_0 {
+        HALT_AT: 85C;
+        THROTTLE_AT: 80C;
+        POLL: nvidia-smi;
+    }
+
+    Memory VRAM {
+        TOTAL: 8GB;
+        RESERVED: 256MB;  // Metapage and control structures
+    }
+}
+
+Vessel NVME_BOOT {
+    PCI_ID: 126f:2263;
+    NAME: "Samsung 970 Evo";
+
+    BLOCK_DEVICE: /dev/nvme0n1;
+    DMA_CAPABLE: true;
+    DMA_MAX_BURST: 4096;
+
+   物理地址表 WEIGHTS {
+        OFFSET_1: 0x1000;
+        OFFSET_2: 0x101000;
+        OFFSET_3: 0x201000;
+        OFFSET_4: 0x301000;
+    }
+}
+
+Vessel CPU_CORE_0 {
+    CORE_ID: 0;
+    ISOLATED: true;
+    REAL_TIME: true;
+    CACHE_LINE: 64B;
+}
+
+Vessel SYSTEM {
+    PCIe_GEN: 3;
+    PCIe_LANES: 16;
+    IOMMU: enabled;
+    MAX_DMA_SIZE: 4GB;
+}

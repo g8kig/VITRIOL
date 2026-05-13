@@ -1,0 +1,33 @@
+// The Vial: GTX 960 2GB Configuration
+// Auto-generated for PCI device 0000:02:00.0
+// BAR 1: 256MB prefetchable window at 0xc0000000
+
+Vessel GTX_960 {
+    PCI_ID: 10de:1401;
+    NAME: "GTX 960 2GB";
+    BDF: 0000:02:00.0;
+
+    Aperture DATA_PLANE {
+        BAR: 1;
+        BASE: 0xc0000000;
+        SIZE: 256MB;
+        TYPE: Prefetchable;
+    }
+
+    Aperture CTRL_PLANE {
+        BAR: 0;
+        BASE: 0xf4000000;
+        SIZE: 16MB;
+        TYPE: NonPrefetchable;
+    }
+
+    Thermal SENSOR_0 {
+        HALT_AT: 98000;
+        THROTTLE_AT: 90000;
+    }
+
+    Memory VRAM {
+        TOTAL: 2GB;
+        RESERVED: 256MB;
+    }
+}

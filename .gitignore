@@ -86,3 +86,13 @@ alka/results/
 # OS files
 Thumbs.db
 .DS_Store
+alka-executor/alka-executor
+alka-executor/gguf-offset-resolver
+alka/generated/
+*.alkas
+*.azoth
+vitriol-daemon/*.ko
+vitriol-daemon/*.o
+vitriol-daemon/*.mod*
+vitriol-daemon/modules.order
+vitriol-daemon/Module.symvers

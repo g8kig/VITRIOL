@@ -113,22 +113,39 @@ CUDA_VISIBLE_DEVICES=0,1 /mnt/data/ai/llama.cpp/bin/llama-server \
 
 ---
 
-## Step 4: NVMe→GPU DMA Path (HELD IN RESERVE)
+## Step 4: NVMe→GPU DMA Path ✅ PIPELINE COMPLETE
 
-**Trigger:** Steps 1-3 confirmed working, trust in Alka established.
+**Status:** Recipe generation pipeline working. Benchmark pending execution.
 
-### Goal: Replace CPU staging with direct NVMe→GPU DMA.
+### What's Done
+1. ✅ `vitriol.ko` v0.2 with Alka ABI (0xA1 magic) — 5 new IOCTLs, 11 opcode handlers
+2. ✅ `gguf-offset-resolver` — Parses GGUF v3, extracts real tensor offsets (733 tensors)
+3. ✅ `generate-alka-recipe.sh` — Generates `.alka` from GGUF + `.alkavl`
+4. ✅ `alka-executor` — Validates and executes `.alkas` streams via `/dev/vitriol`
+5. ✅ Alka compiler integration — Auto-compiles recipes to `.alkas` + `.azoth`
+6. ✅ Generated streams: base (1,226 packets, 39KB), full (1,466 packets, 47KB)
+7. ✅ Executor dry-run passes for both streams
 
-### Approach
-1. Test `vitriol.ko` safely (VM or secondary system)
-2. Wire Alka Metrod packets to kernel IOCTLs
-3. Replace `cudaMemcpyAsync` with `FLOW` instruction
-4. Measure DMA bandwidth vs CPU transfer
+### Generated Stream Stats
+| Recipe | Packets | Binary | Total Data |
+|--------|---------|--------|------------|
+| Base (non-expert) | 1,226 | 39 KB | 81.2 GB |
+| Full (all tensors) | 1,466 | 47 KB | 105.1 GB |
 
-### Expected Outcome
-- Expert loading at PCIe 3.0 x16 speeds (~6-12 GB/s)
-- tok/s matches or exceeds 9B baseline (10+ tok/s)
-- VRAM usage stays under 8GB
+### Remaining
+- [ ] Run `./scripts/benchmark_alka.sh` (requires sudo, ~15 min)
+- [ ] Replace staged FLOW with direct NVMe→GPU DMA (`blkdev_direct_read()`)
+- [ ] Interrupt-driven FENCE (NVMe completion queue vs polling)
+- [ ] GPU kernel launch via SIGNAL
+
+### Files
+- `FINDINGS_2026-05-13-alka-benchmark.md` — Full pipeline documentation
+- `docs/ALKA_EXECUTOR_DESIGN.md` — Executor + ABI design
+- `vitriol-daemon/vitriol.c` — Kernel module v0.2
+- `alka-executor/executor.c` — Userspace executor
+- `alka-executor/gguf-offset-resolver.c` — GGUF parser
+- `scripts/generate-alka-recipe.sh` — Dynamic recipe generator
+- `scripts/benchmark_alka.sh` — Benchmark pipeline
 
 ---
 
@@ -141,9 +158,10 @@ CUDA_VISIBLE_DEVICES=0,1 /mnt/data/ai/llama.cpp/bin/llama-server \
 4. **PCIe 3.0 x16 theoretical: 12 GB/s** — DMA could reduce expert loading from ~100ms to ~20ms
 
 ### Recommended Order
-1. **Step 3 first** (speculative decoding) — highest potential impact (4-6x speedup), requires only downloading a small model
-2. **Step 2 second** (prefetch) — moderate impact (1.5-2x speedup), requires llama.cpp modifications
-3. **Step 4 last** (DMA) — endgame, requires Alka kernel module testing
+1. **Run benchmark first** — `./scripts/benchmark_alka.sh` establishes Alka baseline
+2. **Step 3** (speculative decoding) — highest potential impact (4-6x speedup)
+3. **Step 2** (prefetch) — moderate impact (1.5-2x speedup)
+4. **Step 4 DMA optimization** — replace staged copy with direct NVMe→GPU
 
 ### Quick Win
 Download a Qwen2.5-0.5B draft model and test speculative decoding. This could push us from 7.2 tok/s to 30-40+ tok/s with minimal engineering effort.
