@@ -16,11 +16,11 @@ Powered by **Alka**
 
 VITRIOL runs large language models on **VRAM-constrained hardware** by streaming only the active MoE experts from disk to GPU, instead of loading the full model. The model never fully sits in memory.
 
-**Current approach:** llama.cpp's `-ot` flag keeps 256 experts on CPU while embedding + attention layers run on GPU. This fits a 35B model in 775MB of VRAM.
+**Current approach:** Copy Engine DMA — uses the GPU's own silicon DMA engine to pull expert weights directly from system memory into VRAM at PCIe 3.0 x16 speeds (~12 GB/s theoretical). No CPU copy, no kernel driver unbind, no display crashes. The GPU's internal `NV_C0B5` Copy Engine (Pascal) executes `MEM_TO_MEM` transfers while compute kernels run concurrently.
 
-**Target approach:** Direct NVMe→GPU DMA via PCIe P2P (`vitriol.ko` kernel module), orchestrated by the Alka language, for sub-millisecond expert swapping.
+**Previous approaches (archived):** PCI BIND (GMMU cold brick → `0xBAD0FBxx`), PAT side-load (kernel enforces cache type consistency), Nouveau init (mutual exclusion with nvidia), CUDA P2P (GeForce SKU lock). All documented in `MILESTONE_1.md`.
 
-**Origin:** Built and optimized on a GTX 1070 Ti (Pascal, 8GB) + i7-3770 (Ivy Bridge). The architecture generalizes to any hardware where VRAM is the bottleneck.
+**Origin:** Built and optimized on a GTX 1070 Ti (Pascal, 8GB) + i7-3770 (Ivy Bridge). The architecture generalizes to any CUDA-capable GPU where VRAM is the bottleneck.
 
 ---
 
@@ -30,14 +30,17 @@ VITRIOL runs large language models on **VRAM-constrained hardware** by streaming
 Model: Qwen3.6-35B-A3B (256 experts, 8 active/token, 2-bit quant)
          │
          ▼
-┌─────────────────────┐       ┌─────────────────────┐
-│     GPU (775MB)     │       │   CPU/Host (10.6GB)   │
-│  Embeddings + Attn  │       │   All 256 experts     │
-│  20/41 layers       │       │   (on-demand loading) │
-└─────────────────────┘       └─────────────────────┘
+┌──────────────────────────────┐     ┌──────────────────┐
+│         GPU (8GB VRAM)       │     │   CPU / Host     │
+│  Embeddings + Attention      │     │  io_uring reads  │
+│  KV Cache                    │     │  experts from    │
+│  Expert Cache (~160 experts) │◄────│  GGUF into       │
+│  (Copy Engine streams on     │     │  pinned bounce   │
+│   cache miss)                │     │  buffers         │
+└──────────────────────────────┘     └──────────────────┘
 ```
 
-**Key constraint:** GPU VRAM is 8GB. Full model is 8.8GB. Solution: don't load all 256 experts — only 8 are active per token.
+**Key constraint:** GPU VRAM is 8GB. Full model is 8.8GB. Solution: don't load all 256 experts — only 8 are active per token, and an LRU cache of ~160 experts fits in VRAM alongside the base model.
 
 ---
 
@@ -46,15 +49,17 @@ Model: Qwen3.6-35B-A3B (256 experts, 8 active/token, 2-bit quant)
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │   Alka (Orchestration)                                        │
-│   FLOW = load expert, SHIFT = slide BAR1 window               │
+│   FLOW = CE DMA, FENCE = metapage semaphore                   │
 ├───────────────────────────────────────────────┬───────────────┤
-│   llama.cpp (Inference)                       │ VITRIOL (DMA) │
-│   Tokenization, KV cache, attention compute  │ vitriol.ko    │
-│                                                │ NVMe→GPU P2P  │
+│   llama.cpp (Inference)                       │ VITRIOL (CE)  │
+│   Tokenization, KV cache, attention compute  │ vitriol_ce    │
+│                                                │ NVMe→VRAM CE  │
+│                                                │ DMA (doorbell)│
 ├───────────────────────┬───────────────────────┴───────────────┤
 │     GPU (8GB)         │      SSD (NVMe)                       │
-│  Base model (always)  │   256 experts (1 at a time)            │
-│  Active experts (swapped)│  12GB GGUF file                     │
+│  Base model (always)  │   256 experts (on demand)              │
+│  Expert cache (~160)  │   12GB GGUF file                      │
+│  KV Cache             │   io_uring + O_DIRECT to bounce       │
 └───────────────────────┴───────────────────────────────────────┘
 ```
 
@@ -106,6 +111,9 @@ See `RESOURCE_LOCATIONS.md` for all path configuration and `vitriol.env.example`
 ```
 ├── alka-executor/
 │   ├── executor.c               # Alka stream executor (userspace)
+│   ├── vitriol_copy_engine.c    # NV_C0B5 Copy Engine DMA implementation
+│   ├── vitriol_copy_engine.h    # CE constants + API (from NVIDIA clc0b5.h)
+│   ├── vitriol_ce_test.c        # Standalone CE DMA verification
 │   ├── gguf-offset-resolver.c   # GGUF tensor offset parser
 │   └── vitriol_alka_user.h      # Alka ABI header (userspace)
 ├── alka/
@@ -115,6 +123,8 @@ See `RESOURCE_LOCATIONS.md` for all path configuration and `vitriol.env.example`
 │   └── results/                 # Benchmark results
 ├── alka-handoff/                # Pre-compiled streams from Alka team
 ├── docs/
+│   ├── COPY_ENGINE_PLAN.md      # CE implementation plan (doorbell path)
+│   ├── VITRIOL_GTX960_SETUP.md  # GTX 960 setup (archived)
 │   └── ALKA_EXECUTOR_DESIGN.md  # Executor + ABI documentation
 ├── scripts/
 │   ├── generate-alka-recipe.sh  # GGUF → .alka recipe generator
@@ -125,13 +135,16 @@ See `RESOURCE_LOCATIONS.md` for all path configuration and `vitriol.env.example`
 │   ├── vitriol.c                # Kernel module v0.2 (Alka ABI)
 │   └── vitriol_alka_kernel.h    # Alka ABI header (kernel)
 ├── llama.cpp-patches/           # Unified diffs for llama.cpp
-├── llama.cpp/                   # git submodule
+├── llama.cpp/                   # git submodule (patched)
 ├── include/
 │   ├── vitriol-moe-expert-parser.h   # Expert tensor parsing
 │   └── vitriol-expert-cache.h        # LRU cache for expert loading
-└── src/
-    ├── vitriol-moe-expert-parser.cpp
-    └── vitriol-expert-cache.cpp
+├── src/
+│   ├── vitriol-moe-expert-parser.cpp
+│   └── vitriol-expert-cache.cpp
+├── MILESTONE_1.md               # Full journey documentation
+├── MILESTONE_2.md               # (future) CE DMA integration in llama.cpp
+└── assets/                      # Logos, diagrams
 ```
 
 ---
@@ -155,7 +168,7 @@ VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe,
 | Project | What We Learned |
 |---------|-----------------|
 | **[gds-nvidia-fs](https://github.com/NVIDIA/gds-nvidia-fs)** (NVIDIA) | Official GPUDirect Storage source code. We studied `nvfs-core.c`, `nvfs-pci.c`, and `nvfs-dma.c` to understand: kiocb completion callbacks for NVMe, shared metapage (4KB) for fast completion signaling, `wmb()` memory barriers before DMA. |
-| **[open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules)** (NVIDIA) | NVIDIA's open kernel module source for PCIe register-level operations — reference for understanding BAR mapping and GPU PCI config space. |
+| **[open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules)** (NVIDIA) | NVIDIA's open kernel module source containing the exact NV_C0B5 class definition (`clc0b5.h`) for the Pascal DMA Copy Engine. Also `clb06f.h` (Maxwell Channel GPFIFO) for the UserD/GPFIFO/doorbell register interface. The Pushbuffer method format and LAUNCH_DMA bitflags were extracted from these headers. |
 | **[hw-nvdla](https://github.com/NVIDIA/hw-nvdla)** (NVIDIA) | Hardware DLA documentation for understanding direct memory access patterns on NVIDIA silicon. |
 
 ### Async Scheduling & MoE Orchestration

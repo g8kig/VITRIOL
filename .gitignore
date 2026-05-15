@@ -105,3 +105,5 @@ test_p2p_attrs
 test_mem_create
 test_ioctl
 scripts/gen_test_stream
+vitriol-daemon/vitriol.mod.c
+alka-executor/vitriol_ce_test
