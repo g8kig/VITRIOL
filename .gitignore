@@ -96,3 +96,12 @@ vitriol-daemon/*.o
 vitriol-daemon/*.mod*
 vitriol-daemon/modules.order
 vitriol-daemon/Module.symvers
+
+# Test binaries (compiled from test_*.c/.cu)
+vitriol_readback
+test_p2p_dma
+test_p2p_caps
+test_p2p_attrs
+test_mem_create
+test_ioctl
+scripts/gen_test_stream

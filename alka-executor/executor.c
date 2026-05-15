@@ -11,7 +11,8 @@
  * Usage: alka-executor <stream.alkas> <vial.alkavl> [--dry-run] [--rollback <azoth>]
  */
 
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,9 +22,12 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <errno.h>
 #include <time.h>
 #include <getopt.h>
+#include <signal.h>
+#include <sys/types.h>
 
 #include "vitriol_alka_user.h"
 
@@ -611,11 +615,227 @@ static void usage(const char *prog)
 {
     printf("Usage: %s <stream.alkas> <vial.alkavl> [options]\n", prog);
     printf("\nOptions:\n");
-    printf("  --dry-run          Validate without executing\n");
-    printf("  --rollback <file>  Azoth rollback file\n");
-    printf("  --device <path>    VITRIOL device path (default: /dev/vitriol)\n");
-    printf("  --verbose          Print detailed validation info\n");
-    printf("  --help             Show this help\n");
+    printf("  --dry-run           Validate without executing\n");
+    printf("  --rollback <file>   Azoth rollback file\n");
+    printf("  --source <path>     GGUF source file for FLOW transfers\n");
+    printf("  --bind <BDF>        Bind PCI device to VITRIOL via fork-safe sysfs\n");
+    printf("                      (e.g. 0000:02:00.0). Uses driver_override +\n");
+    printf("                      hot-remove + rescan with 30s timeout.\n");
+    printf("  --cooperative       Use nvidia P2P cooperative DMA (no unbind needed)\n");
+    printf("  --gpu-va <addr>     GPU virtual address for cooperative DMA (hex)\n");
+    printf("  --p2p-token <val>   nvidia P2P token for GPU VA (from CUDA driver API)\n");
+    printf("  --va-space-token <v> nvidia VA space token for GPU VA\n");
+    printf("  --device <path>     VITRIOL device path (default: /dev/vitriol)\n");
+    printf("  --verbose           Print detailed validation info\n");
+    printf("  --help              Show this help\n");
+}
+
+/* ── Safe Userspace PCI Device Binding ──────────────────────────── */
+/*
+ * Uses fork-based timeout to avoid kernel D-state hangs.
+ * The child process does the sysfs writes; if it blocks in D-state,
+ * the parent times out and the orphaned child is safely reaped by init.
+ * No kernel workqueue involvement — rmmod is always safe.
+ */
+
+#include <sys/wait.h>
+#include <sys/types.h>
+
+static int bind_pci_device(int dev_fd, const char *bdf)
+{
+    char path[256];
+    int retry;
+    pid_t pid;
+    int status;
+    const char *bdf_short;
+
+    /* Strip domain prefix for sysfs (some kernels want "0000:02:00.0", some want "02:00.0") */
+    bdf_short = strchr(bdf, ':');
+    if (!bdf_short) bdf_short = bdf;
+
+    printf("Bind: spawning child for %s sysfs operations...\n", bdf);
+
+    /* Pre-flight check: what driver owns this device? */
+    {
+        char drvlink[256];
+        struct stat drvstat;
+        snprintf(drvlink, sizeof(drvlink),
+                 "/sys/bus/pci/devices/%s/driver", bdf);
+        if (stat(drvlink, &drvstat) == 0) {
+            char linkbuf[128];
+            ssize_t len = readlink(drvlink, linkbuf, sizeof(linkbuf) - 1);
+            if (len > 0) {
+                linkbuf[len] = '\0';
+                const char *drv = strrchr(linkbuf, '/');
+                drv = drv ? drv + 1 : linkbuf;
+                if (strcmp(drv, "vitriol") == 0) {
+                    printf("Bind: %s already belongs to vitriol, skipping\n", bdf);
+                    return 0;
+                }
+                printf("Bind: %s currently owned by %s\n", bdf, drv);
+                if (strcmp(drv, "nvidia") == 0) {
+                    printf("Bind: nvidia holds this device — display manager may block\n");
+                    printf("Bind: timeout expected; switch to TTY if this fails\n");
+                }
+            }
+        } else {
+            printf("Bind: %s has no driver — attempting direct bind\n", bdf);
+        }
+    }
+
+    /*
+     * Strategy: try multiple vectors for claiming the GPU from nvidia.
+     *
+     * Vector 1 (clean): driver_override + unbind + vitriol bind
+     *   - Set driver_override so nvidia can't re-claim
+     *   - Write BDF to nvidia's unbind file (graceful release)
+     *   - Write BDF to vitriol's bind file (claim it)
+     *
+     * Vector 2 (force): driver_override + remove + rescan
+     *   - Set driver_override
+     *   - Remove device from PCI subsystem (bypasses nvidia refcount)
+     *   - Rescan PCI bus (vitriol probes on reappearance)
+     */
+
+    pid = fork();
+    if (pid == -1) {
+        fprintf(stderr, "Error: fork failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* ── Child process ── */
+        int fd;
+
+        /* Set driver_override first (restraining order against nvidia) */
+        snprintf(path, sizeof(path),
+                 "/sys/bus/pci/devices/%s/driver_override", bdf);
+        fd = open(path, O_WRONLY);
+        if (fd >= 0) {
+            ssize_t w = write(fd, "vitriol\n", 8);
+            (void)w;
+            close(fd);
+        }
+
+        /* ── Vector 1: Try unbind from nvidia ── */
+        snprintf(path, sizeof(path),
+                 "/sys/bus/pci/drivers/nvidia/unbind");
+        fd = open(path, O_WRONLY);
+        if (fd >= 0) {
+            ssize_t w = write(fd, bdf_short, strlen(bdf_short));
+            (void)w;
+            w = write(fd, "\n", 1);
+            (void)w;
+            close(fd);
+
+            /* If unbind succeeded, try binding to vitriol directly */
+            snprintf(path, sizeof(path),
+                     "/sys/bus/pci/drivers/vitriol/bind");
+            fd = open(path, O_WRONLY);
+            if (fd >= 0) {
+                ssize_t w = write(fd, bdf_short, strlen(bdf_short));
+                (void)w;
+                w = write(fd, "\n", 1);
+                (void)w;
+                close(fd);
+                _exit(0);  /* Vector 1 succeeded */
+            }
+        }
+
+        /* ── Vector 2: Remove + rescan (forceful) ── */
+        /* Re-set driver_override (guarantee it's set) */
+        snprintf(path, sizeof(path),
+                 "/sys/bus/pci/devices/%s/driver_override", bdf);
+        fd = open(path, O_WRONLY);
+        if (fd >= 0) {
+            ssize_t w = write(fd, "vitriol\n", 8);
+            (void)w;
+            close(fd);
+        }
+
+        /* Remove the device (this calls nvidia's remove callback) */
+        snprintf(path, sizeof(path),
+                 "/sys/bus/pci/devices/%s/remove", bdf);
+        fd = open(path, O_WRONLY);
+        if (fd >= 0) {
+            ssize_t w = write(fd, "1\n", 2);
+            (void)w;
+            close(fd);
+        }
+
+        /* Rescan PCI bus */
+        fd = open("/sys/bus/pci/rescan", O_WRONLY);
+        if (fd >= 0) {
+            ssize_t w = write(fd, "1\n", 2);
+            (void)w;
+            close(fd);
+        }
+
+        _exit(0);
+    }
+
+    /*
+     * Parent — wait for completion with 30s timeout.
+     * If child blocks in D-state, SIGKILL won't immediately
+     * wake it, but the parent can safely continue. The orphaned
+     * child will be cleaned up when the kernel operation completes.
+     */
+
+    printf("Bind: waiting for device to reappear under vitriol...\n");
+
+    for (retry = 0; retry < 60; retry++) {
+        int status;
+        pid_t ret = waitpid(pid, &status, WNOHANG);
+        if (ret == pid) {
+            /* Child exited */
+            if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+                fprintf(stderr, "Warning: BIND child failed (exit=%d)\n",
+                        WEXITSTATUS(status));
+            }
+        }
+
+        /* Check if device appeared under vitriol */
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/driver", bdf);
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            char linkbuf[128];
+            ssize_t len = readlink(path, linkbuf, sizeof(linkbuf) - 1);
+            if (len > 0) {
+                linkbuf[len] = '\0';
+                const char *drv = strrchr(linkbuf, '/');
+                drv = drv ? drv + 1 : linkbuf;
+                if (strcmp(drv, "vitriol") == 0) {
+                    printf("Bind: %s → vitriol\n", bdf);
+                    /* Kill child if still alive */
+                    kill(pid, SIGKILL);
+                    waitpid(pid, &status, 0);
+                    return 0;
+                }
+            }
+        } else {
+            if (retry == 0)
+                printf("Bind: device removed, waiting for rescan...\n");
+        }
+
+        usleep(500000);  /* 0.5s */
+    }
+
+    /* Timeout — kill child if still alive */
+    fprintf(stderr, "Error: BIND did not complete within 30s\n");
+    fprintf(stderr, "  Child PID %d may be in D-state (orphaning safe)\n", pid);
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  The nvidia driver likely holds display refs on %s.\n", bdf);
+    fprintf(stderr, "  Switch to TTY (Ctrl+Alt+F3) and run:\n");
+    fprintf(stderr, "    sudo systemctl stop gdm\n");
+    fprintf(stderr, "    echo 'vitriol' | sudo tee /sys/bus/pci/devices/%s/driver_override\n", bdf);
+    fprintf(stderr, "    echo '1' | sudo tee /sys/bus/pci/devices/%s/remove\n", bdf);
+    fprintf(stderr, "    echo '1' | sudo tee /sys/bus/pci/rescan\n");
+    fprintf(stderr, "    ./alka-executor/alka-executor ...\n");
+    fprintf(stderr, "  Or use the automated script: sudo ./vitriol_bind_and_test.sh\n");
+    return -1;
 }
 
 int main(int argc, char *argv[])
@@ -623,24 +843,42 @@ int main(int argc, char *argv[])
     const char *stream_path = NULL;
     const char *vial_path = NULL;
     const char *azoth_path = NULL;
+    const char *source_path = NULL;
+    const char *bind_bdf = NULL;
+    const char *gpu_va_str = NULL;
+    const char *p2p_token_str = NULL;
+    const char *va_space_token_str = NULL;
     const char *device_path = DEVICE_PATH;
     int dry_run = 0;
+    int cooperative = 0;
     int verbose = 0;
 
     static struct option long_options[] = {
-        {"dry-run",  no_argument,       0, 'd'},
-        {"rollback", required_argument, 0, 'r'},
-        {"device",   required_argument, 0, 'D'},
-        {"verbose",  no_argument,       0, 'v'},
-        {"help",     no_argument,       0, 'h'},
+        {"dry-run",        no_argument,       0, 'd'},
+        {"rollback",       required_argument, 0, 'r'},
+        {"source",         required_argument, 0, 's'},
+        {"bind",           required_argument, 0, 'b'},
+        {"cooperative",    no_argument,       0, 'c'},
+        {"gpu-va",         required_argument, 0, 'g'},
+        {"p2p-token",      required_argument, 0, 'T'},
+        {"va-space-token", required_argument, 0, 'S'},
+        {"device",         required_argument, 0, 'D'},
+        {"verbose",        no_argument,       0, 'v'},
+        {"help",           no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "dr:D:vh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "dr:s:b:cg:T:S:D:vh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'd': dry_run = 1; break;
         case 'r': azoth_path = optarg; break;
+        case 's': source_path = optarg; break;
+        case 'b': bind_bdf = optarg; break;
+        case 'c': cooperative = 1; break;
+        case 'g': gpu_va_str = optarg; break;
+        case 'T': p2p_token_str = optarg; break;
+        case 'S': va_space_token_str = optarg; break;
         case 'D': device_path = optarg; break;
         case 'v': verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
@@ -698,6 +936,13 @@ int main(int argc, char *argv[])
         vial.thermal_halt = main_vessel->thermal_halt;
         vial.thermal_throttle = main_vessel->thermal_throttle;
         vial.dma_capable = main_vessel->dma_capable;
+        vial.cooperative = cooperative;
+        if (gpu_va_str)
+            vial.gpu_va = strtoull(gpu_va_str, NULL, 0);
+        if (p2p_token_str)
+            vial.p2p_token = strtoull(p2p_token_str, NULL, 0);
+        if (va_space_token_str)
+            vial.va_space_token = strtoul(va_space_token_str, NULL, 0);
     }
 
     /* Open device (skip if dry-run) */
@@ -719,6 +964,33 @@ int main(int argc, char *argv[])
         if (ret != 0) {
             fprintf(stderr, "Warning: Failed to set vial in kernel: %s\n",
                     strerror(errno));
+        }
+
+        /* Send source file to kernel */
+        if (source_path && !dry_run) {
+            int src_fd = open(source_path, O_RDONLY);
+            if (src_fd < 0) {
+                fprintf(stderr, "Warning: Cannot open source file %s: %s\n",
+                        source_path, strerror(errno));
+            } else {
+                struct vitriol_source src = {0};
+                src.fd = src_fd;
+                ret = ioctl(fd, VITRIOL_IOC_SET_SOURCE, &src);
+                if (ret != 0) {
+                    fprintf(stderr, "Warning: Failed to set source file: %s\n",
+                            strerror(errno));
+                } else {
+                    printf("Source: %s (fd=%d)\n", source_path, src_fd);
+                }
+            }
+        }
+
+        /* Bind PCI device if requested (via kernel workqueue IOCTL) */
+        if (bind_bdf) {
+            if (bind_pci_device(fd, bind_bdf) != 0) {
+                fprintf(stderr, "Warning: BIND failed for %s, continuing anyway\n",
+                        bind_bdf);
+            }
         }
     }
 

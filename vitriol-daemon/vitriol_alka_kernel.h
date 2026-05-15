@@ -74,7 +74,11 @@ struct vitriol_vial {
     __u8   thermal_halt;    /* Temperature to halt at (°C)     */
     __u8   thermal_throttle;/* Temperature to throttle at (°C) */
     __u8   dma_capable;     /* 1 if DMA is available           */
-    __u8   _pad[5];         /* Alignment padding               */
+    __u8   cooperative;     /* 1 = use nvidia P2P cooperative  */
+    __u64  p2p_token;       /* nvidia P2P token for this VA    */
+    __u32  va_space_token;  /* nvidia VA space token           */
+    __u32  _pad;            /* Alignment padding               */
+    __u64  gpu_va;          /* GPU virtual address for coop DMA*/
 } __attribute__((packed));
 
 /* ── Execution Result ──────────────────────────────────────────── */
@@ -126,6 +130,32 @@ struct vitriol_stream_req {
     __u32  _pad1;
 } __attribute__((packed));
 
+/* ── Source File (GGUF/NVMe path) ──────────────────────────────── */
+
+/* Pass an already-opened file descriptor from userspace */
+struct vitriol_source {
+    __s32  fd;              /* Opened file descriptor           */
+    __u32  _pad;
+} __attribute__((packed));
+
+/* ── BIND Request ──────────────────────────────────────────────── */
+
+#define VITRIOL_BDF_MAX_LEN 13
+
+struct vitriol_bind_req {
+    char bdf[VITRIOL_BDF_MAX_LEN];   /* "0000:01:00.0\0"        */
+    __u8  force;                      /* 0 = normal, 1 = force   */
+    __u8  _pad[3];
+} __attribute__((packed));
+
+/* ── BAR1 Readback Request ─────────────────────────────────────── */
+
+struct vitriol_bar1_read {
+    __u64  bar1_offset;    /* Offset into BAR1                  */
+    __u64  size;           /* Bytes to read                     */
+    __u64  buf;            /* Userspace buffer address           */
+} __attribute__((packed));
+
 /* ── IOCTL Commands (0xA1 magic) ───────────────────────────────── */
 
 #define VITRIOL_IOC_MAGIC     0xA1
@@ -134,5 +164,8 @@ struct vitriol_stream_req {
 #define VITRIOL_IOC_SET_VIAL  _IOW(VITRIOL_IOC_MAGIC, 3, struct vitriol_vial)
 #define VITRIOL_IOC_GET_RESULT _IOR(VITRIOL_IOC_MAGIC, 4, struct vitriol_result)
 #define VITRIOL_IOC_STREAM    _IOW(VITRIOL_IOC_MAGIC, 5, struct vitriol_stream_req)
+#define VITRIOL_IOC_SET_SOURCE _IOW(VITRIOL_IOC_MAGIC, 6, struct vitriol_source)
+#define VITRIOL_IOC_BIND_DEVICE _IOW(VITRIOL_IOC_MAGIC, 7, struct vitriol_bind_req)
+#define VITRIOL_IOC_READ_BAR1  _IOR(VITRIOL_IOC_MAGIC, 8, struct vitriol_bar1_read)
 
 #endif /* VITRIOL_ALKA_KERNEL_H */

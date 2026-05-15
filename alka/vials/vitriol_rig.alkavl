@@ -76,6 +76,8 @@ Vessel NVME_SSD {
         PATH: /mnt/data/ai/koboldcpp/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf;
         SIZE: 12.3GB;
         EXPERT_OFFSET: 0x100000000;
+        // NOTE: Override the model path at compile time:
+        // alka recipe.alka vial.alkavl -DMODEL_PATH=/your/path/model.gguf
     }
 }
 

@@ -74,7 +74,11 @@ struct vitriol_vial {
     uint8_t  thermal_halt;    /* Temperature to halt at (°C)     */
     uint8_t  thermal_throttle;/* Temperature to throttle at (°C) */
     uint8_t  dma_capable;     /* 1 if DMA is available           */
-    uint8_t  _pad[5];         /* Alignment padding               */
+    uint8_t  cooperative;     /* 1 = use nvidia P2P cooperative  */
+    uint64_t p2p_token;       /* nvidia P2P token for this VA    */
+    uint32_t va_space_token;  /* nvidia VA space token           */
+    uint32_t _pad;            /* Alignment padding               */
+    uint64_t gpu_va;          /* GPU virtual address for coop DMA*/
 } __attribute__((packed));
 
 /* ── Execution Result ──────────────────────────────────────────── */
@@ -112,6 +116,32 @@ struct vitriol_stream_req {
     uint32_t _pad1;
 } __attribute__((packed));
 
+/* ── Source File (GGUF/NVMe path) ──────────────────────────────── */
+
+/* Pass an already-opened file descriptor from userspace */
+struct vitriol_source {
+    int32_t  fd;            /* Opened file descriptor           */
+    uint32_t _pad;
+} __attribute__((packed));
+
+/* ── BIND Request ──────────────────────────────────────────────── */
+
+#define VITRIOL_BDF_MAX_LEN 13
+
+struct vitriol_bind_req {
+    char bdf[VITRIOL_BDF_MAX_LEN];   /* "0000:01:00.0\0"        */
+    uint8_t  force;                   /* 0 = normal, 1 = force   */
+    uint8_t  _pad[3];
+} __attribute__((packed));
+
+/* ── BAR1 Readback Request ─────────────────────────────────────── */
+
+struct vitriol_bar1_read {
+    uint64_t bar1_offset;    /* Offset into BAR1                  */
+    uint64_t size;           /* Bytes to read                     */
+    uint64_t buf;            /* Userspace buffer address           */
+} __attribute__((packed));
+
 /* ── IOCTL Commands (0xA1 magic) ───────────────────────────────── */
 
 #include <sys/ioctl.h>
@@ -122,6 +152,9 @@ struct vitriol_stream_req {
 #define VITRIOL_IOC_SET_VIAL  _IOW(VITRIOL_IOC_MAGIC, 3, struct vitriol_vial)
 #define VITRIOL_IOC_GET_RESULT _IOR(VITRIOL_IOC_MAGIC, 4, struct vitriol_result)
 #define VITRIOL_IOC_STREAM    _IOW(VITRIOL_IOC_MAGIC, 5, struct vitriol_stream_req)
+#define VITRIOL_IOC_SET_SOURCE _IOW(VITRIOL_IOC_MAGIC, 6, struct vitriol_source)
+#define VITRIOL_IOC_BIND_DEVICE _IOW(VITRIOL_IOC_MAGIC, 7, struct vitriol_bind_req)
+#define VITRIOL_IOC_READ_BAR1  _IOR(VITRIOL_IOC_MAGIC, 8, struct vitriol_bar1_read)
 
 /* ── CRC32 Utility (Alka ROL-XOR algorithm) ────────────────────── */
 

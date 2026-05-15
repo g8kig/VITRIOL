@@ -22,8 +22,34 @@
 #include <linux/dma-mapping.h>
 #include <linux/scatterlist.h>
 #include <linux/blkdev.h>
+#include <linux/fs.h>
 #include <linux/timex.h>
+#include <linux/delay.h>
 #include <linux/crc32.h>
+#include <linux/vmalloc.h>
+#include <linux/kallsyms.h>
+#include <linux/kprobes.h>
+
+/* Forward declare nvidia P2P types (minimal compatible subset) */
+enum nvidia_p2p_page_size_type {
+    NVIDIA_P2P_PAGE_SIZE_4KB = 0,
+    NVIDIA_P2P_PAGE_SIZE_64KB,
+    NVIDIA_P2P_PAGE_SIZE_128KB,
+    NVIDIA_P2P_PAGE_SIZE_COUNT
+};
+
+struct nvidia_p2p_page {
+    uint64_t physical_address;
+    uint32_t registers[6];
+};
+
+struct nvidia_p2p_page_table {
+    uint32_t version;
+    uint32_t page_size;
+    struct nvidia_p2p_page **pages;
+    uint32_t entries;
+    uint8_t *gpu_uuid;
+};
 
 #include "vitriol_alka_kernel.h"
 
@@ -85,6 +111,22 @@ static struct {
     /* Rollback stack */
     struct vitriol_azoth rollback_stack[MAX_EXEC_HISTORY];
     int rollback_count;
+
+    /* Source file (GGUF on NVMe) */
+    struct file *source_file;
+    bool source_set;
+
+    /* Fallback buffer when PCI probe doesn't run (nvidia owns GPU) */
+    void *fallback_buffer;
+
+    /* nvidia P2P cooperative DMA (Level 3) */
+    bool nvidia_p2p_available;
+    int (*nvidia_p2p_get_pages)(uint64_t, uint32_t, uint64_t, uint64_t,
+                                 struct nvidia_p2p_page_table **,
+                                 void (*)(void *), void *);
+    int (*nvidia_p2p_put_pages)(uint64_t, uint32_t, uint64_t,
+                                 struct nvidia_p2p_page_table *);
+    int (*nvidia_p2p_free_page_table)(struct nvidia_p2p_page_table *);
 } vitriol_state;
 
 /* Device Node Operations */
@@ -93,6 +135,10 @@ static int vitriol_release(struct inode *inode, struct file *filp);
 static ssize_t vitriol_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos);
 static ssize_t vitriol_write(struct file *filp, const char __user *buf, size_t count, loff_t *ppos);
 static long vitriol_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+
+/* Source file helpers */
+static int handle_set_source(struct vitriol_source __user *arg);
+static ssize_t read_source_file(loff_t offset, void *buf, size_t count);
 
 static const struct file_operations vitriol_fops = {
     .owner          = THIS_MODULE,
@@ -131,13 +177,6 @@ static __u64 get_cycles_now(void)
     struct timespec64 ts;
     ktime_get_ts64(&ts);
     return (ts.tv_sec * 1000000000ULL) + ts.tv_nsec;
-}
-
-static __u32 vitriol_compute_drop_crc(const struct vitriol_drop *drop)
-{
-    __u32 crc = 0;
-    crc = crc32(crc, (const __u8 *)&drop->op_code, sizeof(*drop) - sizeof(drop->crc));
-    return crc;
 }
 
 static struct vitriol_vessel *find_vessel(__u16 id)
@@ -240,6 +279,9 @@ static int handle_shift(const struct vitriol_drop *drop)
     return 0;
 }
 
+static int handle_flow_cooperative(const struct vitriol_drop *drop,
+                                   struct vitriol_vessel *v);
+
 static int handle_flow(const struct vitriol_drop *drop)
 {
     struct vitriol_vessel *v = find_vessel(drop->vessel_id);
@@ -260,65 +302,87 @@ static int handle_flow(const struct vitriol_drop *drop)
         return -EINVAL;
     }
 
-    /*
-     * DMA transfer: src_addr (NVMe file offset) → dst_addr (GPU BAR1 offset)
-     *
-     * Real implementation would use:
-     *   - blkdev_direct_read() for NVMe
-     *   - pci_write_bar() or DMA engine for GPU
-     *
-     * For now, we use the allocated DMA buffer as staging:
-     *   1. Read from NVMe into dma_buffer
-     *   2. Copy from dma_buffer to BAR1 window
-     */
-
     __u64 src = drop->src_addr;
     __u64 dst = drop->dst_addr + v->bar1_offset;
     __u32 size = drop->size;
+    __u32 total_transferred = 0;
+
+    /* Cooperative nvidia P2P path (preferred — no BAR1 needed) */
+    if (vitriol_state.vial_set && vitriol_state.current_vial.cooperative &&
+        vitriol_state.nvidia_p2p_available &&
+        vitriol_state.current_vial.gpu_va != 0) {
+        return handle_flow_cooperative(drop, v);
+    }
 
     pr_info("VITRIOL: FLOW 0x%llx → 0x%llx (%u bytes)\n", src, dst, size);
 
-    /* Staged copy via DMA buffer (safe placeholder) */
-    if (size > vitriol_state.dma_size) {
-        pr_warn("VITRIOL: FLOW size %u exceeds DMA buffer %zu, clamping\n",
-                size, vitriol_state.dma_size);
-        size = vitriol_state.dma_size;
-    }
-
-    /* In production: replace with actual NVMe→GPU DMA */
-    if (vitriol_state.bar1) {
-        /* Zero the staging buffer (simulated read from NVMe) */
+    if (!vitriol_state.source_set || !vitriol_state.source_file) {
+        pr_warn("VITRIOL: FLOW no source file set, zeroing buffer\n");
+        if (!vitriol_state.bar1) {
+            pr_info("VITRIOL: FLOW skipped (BAR1 not mapped)\n");
+            return 0;
+        }
+        if (vitriol_state.dma_size > 0 && size > vitriol_state.dma_size)
+            size = vitriol_state.dma_size;
         memset(vitriol_state.dma_buffer, 0, size);
-
-        /* Copy to BAR1 window */
         memcpy_toio(vitriol_state.bar1 + dst, vitriol_state.dma_buffer, size);
+        return 0;
     }
 
+    /* Use fallback buffer when PCI probe didn't allocate DMA buffer */
+    void *read_buf = vitriol_state.dma_buffer;
+    if (!read_buf)
+        read_buf = vitriol_state.fallback_buffer;
+    if (!read_buf) {
+        pr_err("VITRIOL: FLOW no buffer available\n");
+        return -ENOMEM;
+    }
+
+    while (total_transferred < size) {
+        __u32 chunk = size - total_transferred;
+        if (vitriol_state.dma_size > 0 && chunk > vitriol_state.dma_size)
+            chunk = vitriol_state.dma_size;
+
+        ssize_t nread = read_source_file(src + total_transferred,
+                                          read_buf, chunk);
+        if (nread < 0) {
+            pr_err("VITRIOL: FLOW read failed at offset 0x%llx: %zd\n",
+                   src + total_transferred, nread);
+            return (int)nread;
+        }
+        if (nread == 0) {
+            pr_warn("VITRIOL: FLOW EOF at offset 0x%llx (transferred %u/%u)\n",
+                    src + total_transferred, total_transferred, size);
+            break;
+        }
+
+        if (vitriol_state.bar1) {
+            memcpy_toio(vitriol_state.bar1 + dst + total_transferred,
+                        read_buf, nread);
+        }
+        total_transferred += nread;
+    }
+
+    pr_info("VITRIOL: FLOW transferred %u/%u bytes\n", total_transferred, size);
     return 0;
 }
 
 static int handle_fence(const struct vitriol_drop *drop)
 {
-    /*
-     * FENCE: Wait for metapage ready signal.
-     * dst_addr encodes the expected metapage value.
-     *
-     * In NVIDIA GDS, the metapage is a shared 4KB page that
-     * the NVMe driver updates when DMA is complete.
-     *
-     * For now, we poll the control plane register.
-     */
     __u64 expected = drop->dst_addr;
-    int retries = 1000;
 
+    if (!vitriol_state.bar0) {
+        pr_info("VITRIOL: FENCE metapage==%llu (simulated, no BAR0)\n", expected);
+        return 0;
+    }
+
+    int retries = 1000;
     pr_info("VITRIOL: FENCE waiting for metapage == %llu\n", expected);
 
     while (retries-- > 0) {
-        if (vitriol_state.bar0) {
-            __u32 status = readl(vitriol_state.bar0);
-            if (status >= expected)
-                return 0;
-        }
+        __u32 status = readl(vitriol_state.bar0);
+        if (status >= expected)
+            return 0;
         udelay(100);
     }
 
@@ -369,8 +433,64 @@ static int handle_dry_run(const struct vitriol_drop *drop)
     return 0;
 }
 
+static int handle_bind_device(struct vitriol_bind_req __user *arg)
+{
+    pr_warn("VITRIOL: BIND not supported in kernel (use userspace --bind or --cooperative)\n");
+    return -ENOTSUPP;
+}
+
+static int handle_set_source(struct vitriol_source __user *arg)
+{
+    struct vitriol_source src;
+    struct file *filp;
+
+    if (copy_from_user(&src, arg, sizeof(src)))
+        return -EFAULT;
+
+    if (src.fd < 0)
+        return -EBADF;
+
+    if (vitriol_state.source_file) {
+        filp_close(vitriol_state.source_file, NULL);
+        vitriol_state.source_file = NULL;
+    }
+
+    filp = fget(src.fd);
+    if (!filp) {
+        pr_err("VITRIOL: SET_SOURCE invalid fd %d\n", src.fd);
+        return -EBADF;
+    }
+
+    vitriol_state.source_file = filp;
+    vitriol_state.source_set = true;
+
+    pr_info("VITRIOL: SET_SOURCE fd=%d (file=%p, size=%lld, mode=0x%x, flags=0x%x)\n",
+            src.fd, filp, file_inode(filp)->i_size,
+            filp->f_mode, filp->f_flags);
+    return 0;
+}
+
+static ssize_t read_source_file(loff_t offset, void *buf, size_t count)
+{
+    ssize_t ret;
+
+    if (!vitriol_state.source_set || !vitriol_state.source_file)
+        return -ENODEV;
+
+    loff_t pos = vfs_llseek(vitriol_state.source_file, offset, SEEK_SET);
+    if (pos != offset)
+        return (ssize_t)(pos < 0 ? pos : -EIO);
+
+    ret = kernel_read(vitriol_state.source_file, buf, count, NULL);
+    return ret;
+}
+
 static int handle_unknown(__u8 opcode)
 {
+    if (!vitriol_state.bar0) {
+        pr_info("VITRIOL: Unknown opcode 0x%x (simulated, accepting)\n", opcode);
+        return 0;
+    }
     pr_warn("VITRIOL: Unknown opcode 0x%x\n", opcode);
     return -ENOSYS;
 }
@@ -457,12 +577,12 @@ static int vitriol_pci_probe(struct pci_dev *dev, const struct pci_device_id *id
     }
     pr_info("VITRIOL: BAR 0 (Control) mapped at %px\n", vitriol_state.bar0);
 
-    vitriol_state.bar1 = pci_iomap(dev, 1, BAR_1_SIZE);
+    vitriol_state.bar1 = pci_iomap_wc(dev, 1, BAR_1_SIZE);
     if (!vitriol_state.bar1) {
         pr_err("VITRIOL: Failed to map BAR 1\n");
         goto err_bar0_unmap;
     }
-    pr_info("VITRIOL: BAR 1 (Data) mapped at %px (256MB VRAM window)\n",
+    pr_info("VITRIOL: BAR 1 (Data) mapped at %px (256MB VRAM window) [WC]\n",
             vitriol_state.bar1);
 
     ret = dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(64));
@@ -512,6 +632,11 @@ err_disable:
 
 static void vitriol_pci_remove(struct pci_dev *dev)
 {
+    if (vitriol_state.source_file) {
+        filp_close(vitriol_state.source_file, NULL);
+        vitriol_state.source_file = NULL;
+        vitriol_state.source_set = false;
+    }
     if (vitriol_state.mapped) {
         if (vitriol_state.dma_buffer)
             dma_free_coherent(&dev->dev, vitriol_state.dma_size,
@@ -552,6 +677,11 @@ static int vitriol_open(struct inode *inode, struct file *filp)
 
 static int vitriol_release(struct inode *inode, struct file *filp)
 {
+    if (vitriol_state.source_file) {
+        filp_close(vitriol_state.source_file, NULL);
+        vitriol_state.source_file = NULL;
+        vitriol_state.source_set = false;
+    }
     pr_info("VITRIOL: Device closed\n");
     return 0;
 }
@@ -576,8 +706,12 @@ static long vitriol_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 {
     int ret = 0;
 
+    pr_info("VITRIOL: ioctl called cmd=0x%x type=0x%x nr=%u size=%u\n",
+            cmd, _IOC_TYPE(cmd), _IOC_NR(cmd), _IOC_SIZE(cmd));
+
     /* Check for Alka 0xA1 magic */
     if (_IOC_TYPE(cmd) == VITRIOL_IOC_MAGIC) {
+        pr_info("VITRIOL: Alka 0xA1 magic detected\n");
         switch (cmd) {
         case VITRIOL_IOC_SET_VIAL: {
             struct vitriol_vial vial;
@@ -653,6 +787,11 @@ static long vitriol_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
             break;
         }
 
+        case VITRIOL_IOC_BIND_DEVICE: {
+            ret = handle_bind_device((struct vitriol_bind_req __user *)arg);
+            break;
+        }
+
         case VITRIOL_IOC_STREAM: {
             struct vitriol_stream_req req;
             struct vitriol_drop *drops;
@@ -715,6 +854,48 @@ stream_done:
             break;
         }
 
+        case VITRIOL_IOC_SET_SOURCE: {
+            ret = handle_set_source((struct vitriol_source __user *)arg);
+            break;
+        }
+
+        case VITRIOL_IOC_READ_BAR1: {
+            struct vitriol_bar1_read req;
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                ret = -EFAULT;
+                break;
+            }
+            if (!vitriol_state.bar1) {
+                pr_err("VITRIOL: READ_BAR1 but BAR1 not mapped\n");
+                ret = -ENODEV;
+                break;
+            }
+            if (req.bar1_offset + req.size > BAR_1_SIZE) {
+                pr_err("VITRIOL: READ_BAR1 offset %llu + size %llu exceeds BAR1\n",
+                       req.bar1_offset, req.size);
+                ret = -EINVAL;
+                break;
+            }
+            void *read_buf = vitriol_state.dma_buffer ?: vitriol_state.fallback_buffer;
+            if (!read_buf) {
+                pr_err("VITRIOL: READ_BAR1 no staging buffer\n");
+                ret = -ENOMEM;
+                break;
+            }
+            __u32 chunk = req.size;
+            if (vitriol_state.dma_size > 0 && chunk > vitriol_state.dma_size)
+                chunk = vitriol_state.dma_size;
+            memcpy_fromio(read_buf, vitriol_state.bar1 + req.bar1_offset, chunk);
+            if (copy_to_user((void __user *)(unsigned long)req.buf, read_buf, chunk)) {
+                ret = -EFAULT;
+                break;
+            }
+            pr_info("VITRIOL: READ_BAR1 offset=0x%llx size=%u\n",
+                    req.bar1_offset, chunk);
+            ret = 0;
+            break;
+        }
+
         default:
             ret = -ENOTTY;
         }
@@ -771,6 +952,127 @@ stream_done:
     return ret;
 }
 
+/* ── nvidia P2P cooperative DMA ───────────────────────────────── */
+
+static void nvidia_p2p_free_callback(void *data) __maybe_unused;
+static void nvidia_p2p_free_callback(void *data)
+{
+}
+
+static int handle_flow_cooperative(const struct vitriol_drop *drop,
+                                   struct vitriol_vessel *v)
+{
+    __u64 p2p_token = vitriol_state.current_vial.p2p_token;
+    __u32 va_space_token = vitriol_state.current_vial.va_space_token;
+    __u64 gpu_va = vitriol_state.current_vial.gpu_va + drop->dst_addr;
+    __u32 size = drop->size;
+    struct nvidia_p2p_page_table *page_table = NULL;
+    void *read_buf;
+    int ret, i;
+
+    if (!vitriol_state.nvidia_p2p_available) {
+        pr_err("VITRIOL: P2P FLOW but nvidia P2P not available\n");
+        return -ENOTSUPP;
+    }
+
+    read_buf = vitriol_state.dma_buffer ?: vitriol_state.fallback_buffer;
+    if (!read_buf) {
+        pr_err("VITRIOL: P2P FLOW no staging buffer\n");
+        return -ENOMEM;
+    }
+
+    pr_info("VITRIOL: P2P FLOW GPU_VA=0x%llx size=%u p2p_token=0x%llx va_token=%u\n",
+            gpu_va, size, p2p_token, va_space_token);
+
+    /* Step 1: Pin VRAM pages via nvidia P2P */
+    ret = vitriol_state.nvidia_p2p_get_pages(p2p_token, va_space_token,
+                                              gpu_va, size,
+                                              &page_table,
+                                              nvidia_p2p_free_callback,
+                                              NULL);
+    if (ret != 0) {
+        pr_err("VITRIOL: nvidia_p2p_get_pages failed: %d\n", ret);
+        return ret;
+    }
+
+    __u32 page_size = 4096;
+    switch (page_table->page_size) {
+    case NVIDIA_P2P_PAGE_SIZE_4KB:  page_size = 4096; break;
+    case NVIDIA_P2P_PAGE_SIZE_64KB: page_size = 65536; break;
+    case NVIDIA_P2P_PAGE_SIZE_128KB: page_size = 131072; break;
+    }
+    pr_info("VITRIOL: P2P got %u pages of %u bytes\n",
+            page_table->entries, page_size);
+
+    /* Step 2: DMA from GGUF file into VRAM pages */
+    __u32 file_offset = drop->src_addr;
+    __u32 transferred = 0;
+
+    for (i = 0; i < page_table->entries && transferred < size; i++) {
+        __u64 phys = page_table->pages[i]->physical_address;
+        __u32 chunk = size - transferred;
+        if (chunk > page_size)
+            chunk = page_size;
+
+        ssize_t nread = read_source_file(file_offset + transferred,
+                                          read_buf, chunk);
+        if (nread <= 0) {
+            pr_err("VITRIOL: P2P FLOW read failed at offset %u\n",
+                   file_offset + transferred);
+            ret = (int)nread;
+            goto out;
+        }
+
+        void __iomem *vram = ioremap(phys, nread);
+        if (!vram) {
+            pr_err("VITRIOL: P2P ioremap failed for phys=0x%llx\n", phys);
+            ret = -ENOMEM;
+            goto out;
+        }
+        memcpy_toio(vram, read_buf, nread);
+        iounmap(vram);
+
+        transferred += nread;
+    }
+
+    pr_info("VITRIOL: P2P FLOW transferred %u/%u bytes\n", transferred, size);
+    ret = 0;
+
+out:
+    vitriol_state.nvidia_p2p_put_pages(0, 0, gpu_va, page_table);
+    vitriol_state.nvidia_p2p_free_page_table(page_table);
+    return ret;
+}
+
+/* Resolve nvidia P2P symbols from the running nvidia.ko module */
+static void resolve_nvidia_p2p(void)
+{
+    struct kprobe kp = { .symbol_name = "nvidia_p2p_get_pages" };
+    if (register_kprobe(&kp) == 0) {
+        vitriol_state.nvidia_p2p_get_pages = (void *)kp.addr;
+        unregister_kprobe(&kp);
+    }
+    kp = (struct kprobe){ .symbol_name = "nvidia_p2p_put_pages" };
+    if (register_kprobe(&kp) == 0) {
+        vitriol_state.nvidia_p2p_put_pages = (void *)kp.addr;
+        unregister_kprobe(&kp);
+    }
+    kp = (struct kprobe){ .symbol_name = "nvidia_p2p_free_page_table" };
+    if (register_kprobe(&kp) == 0) {
+        vitriol_state.nvidia_p2p_free_page_table = (void *)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    if (vitriol_state.nvidia_p2p_get_pages && 
+        vitriol_state.nvidia_p2p_put_pages) {
+        vitriol_state.nvidia_p2p_available = true;
+        pr_info("VITRIOL: nvidia P2P cooperative DMA available\n");
+    } else {
+        vitriol_state.nvidia_p2p_available = false;
+        pr_info("VITRIOL: nvidia P2P not available\n");
+    }
+}
+
 /* ── Module Init / Exit ────────────────────────────────────────── */
 
 static int __init vitriol_init(void)
@@ -782,6 +1084,19 @@ static int __init vitriol_init(void)
     pr_info("VITRIOL: Alka ABI support enabled (0xA1 magic)\n");
 
     memset(&vitriol_state, 0, sizeof(vitriol_state));
+    vitriol_state.dma_size = 1024 * 1024;  /* Default 1MB chunk, PCI probe may override */
+
+    /* Allocate fallback buffer for Direct DMA reads when BAR1 not mapped */
+    vitriol_state.fallback_buffer = vmalloc(vitriol_state.dma_size);
+    if (!vitriol_state.fallback_buffer) {
+        pr_warn("VITRIOL: Failed to allocate fallback buffer\n");
+    } else {
+        pr_info("VITRIOL: Fallback buffer allocated (%zu bytes)\n",
+                vitriol_state.dma_size);
+    }
+
+    /* ── nvidia P2P Symbol Resolution ── */
+    resolve_nvidia_p2p();
 
     ret = alloc_chrdev_region(&vitriol_state.dev_num, 0, 1, DEVICE_NAME);
     if (ret < 0) {
@@ -838,6 +1153,17 @@ err_cdev:
 static void __exit vitriol_exit(void)
 {
     pr_info("VITRIOL: Unloading module\n");
+
+    if (vitriol_state.source_file) {
+        filp_close(vitriol_state.source_file, NULL);
+        vitriol_state.source_file = NULL;
+        vitriol_state.source_set = false;
+    }
+
+    if (vitriol_state.fallback_buffer) {
+        vfree(vitriol_state.fallback_buffer);
+        vitriol_state.fallback_buffer = NULL;
+    }
 
     pci_unregister_driver(&vitriol_pci_driver);
     device_destroy(vitriol_state.class, vitriol_state.dev_num);

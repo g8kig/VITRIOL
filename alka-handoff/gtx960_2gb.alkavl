@@ -6,6 +6,8 @@ Vessel GTX_960 {
     PCI_ID: 10de:1401;
     NAME: "GTX 960 2GB";
     BDF: 0000:02:00.0;
+    DMA_CAPABLE: true;
+    DMA_MAX_BURST: 4096;
 
     Aperture DATA_PLANE {
         BAR: 1;
