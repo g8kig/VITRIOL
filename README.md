@@ -237,22 +237,40 @@ The model (11.44 GiB) does **not fit** in 8 GB VRAM without VITRIOL.
 └── MILESTONE_2.md           ← RAM Shot: success report
 ```
 
----
+## Ars Priori & Acknowledgements
 
-## Ars Priori
+VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe, metapage completion signaling, async expert prefetching, extreme quantization on legacy hardware — was reverse-engineered from the following works. We document our debt explicitly.
 
-*"Visita Interiora Terrae Rectificando Invenies Occultum Lapidem"*
+### Inference Engine
 
-The name VITRIOL is borrowed from alchemy — the universal solvent, the acid that breaks down base metals into their prima materia so they can be reconstituted as gold. It is also a backronym for the alchemist's maxim above: "Visit the Interior of the Earth, by Rectifying you will find the Hidden Stone."
+| Project | What We Learned |
+|---------|-----------------|
+| **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (ggml-org) | The core inference engine. GGUF format, CUDA backend, tensor loading pipeline. The `-ot` (override tensor) flag in PR #11397 was the breakthrough that enabled expert streaming. Our `vitriol-cuda-integration.cpp` hooks into `ggml-cuda.cu` at the tensor-copy boundary. |
+| **[GGUF Format](https://github.com/ggerganov/llama.cpp/blob/master/ggml/include/gguf.h)** | Binary model format with tensor offsets accessible via `gguf_get_tensor_offset()`, `gguf_get_tensor_name()`, `gguf_get_tensor_type()` — the foundation of our expert parser. |
+| **[PR #11397](https://github.com/ggerganov/llama.cpp/pull/11397)** (slaren) | Added `--override-tensor` (`-ot`) for per-tensor-type buffer placement. The exact mechanism we use: `-ot ".*exps.*=CPU"` keeps 8GB of experts on CPU while attention layers run on GPU. |
+| **[PR #11571](https://github.com/ggerganov/llama.cpp/pull/11571)** (fairydreaming) | Load-all-experts-during-warmup; `llama_set_warmup()` API for ensuring all expert tensors are resident before inference. |
+| **[PR #6387](https://github.com/ggerganov/llama.cpp/pull/6387)** (slaren) | Changed expert storage from per-expert tensors to a single 3D tensor — critical for our approach since all 256 experts are now in one contiguous block. |
 
-The parallel is intentional. Consumer GPUs are the base metal: abundant, capable, but VRAM-starved for modern models. VITRIOL is the solvent — it strips away the assumption that all weights must live in VRAM, exposing the hidden capacity underneath. The philosopher's stone, in this case, is a 35B MoE model running on an 8 GB GPU.
+### GPUDirect Storage & DMA
 
-**Alka**, the planned orchestration layer, takes its name from alkahest — the hypothetical universal solvent that alchemists sought after vitriol. Where VITRIOL dissolves the VRAM barrier for a single GPU, Alka will orchestrate across multiple GPUs, coordinating expert placement, speculative decoding, and DMA schedules across devices.
+| Project | What We Learned |
+|---------|-----------------|
+| **[gds-nvidia-fs](https://github.com/NVIDIA/gds-nvidia-fs)** (NVIDIA) | Official GPUDirect Storage source code. We studied `nvfs-core.c`, `nvfs-pci.c`, and `nvfs-dma.c` to understand: kiocb completion callbacks for NVMe, shared metapage (4KB) for fast completion signaling, `wmb()` memory barriers before DMA. |
+| **[open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules)** (NVIDIA) | NVIDIA's open kernel module source for PCIe register-level operations — reference for understanding BAR mapping and GPU PCI config space. |
+| **[hw-nvdla](https://github.com/NVIDIA/hw-nvdla)** (NVIDIA) | Hardware DLA documentation for understanding direct memory access patterns on NVIDIA silicon. |
 
----
+### Async Scheduling & MoE Orchestration
 
-## Acknowledgements
+| Project | What We Learned |
+|---------|-----------------|
+| **[KTransformers](https://github.com/kvcache-ai/KTransformers)** (kvcache-ai) | YAML-based layer placement across CPU/GPU, double-buffer prefetch pattern (compute layer N while streaming N+1), MoE-specific async scheduling. KTransformers targets modern CPUs (AMX/AVX512); VITRIOL inverts this — GPU as primary compute, CPU as orchestrator only. |
+| **Qwen3.6-35B-A3B MoE** | 256 experts, 8 active per token — the exact sparsity architecture that makes expert streaming viable. The MoE router (`ffn_gate_inp`) determines which 8 experts to load; only those need to be in VRAM. |
 
-- **llama.cpp team** (ggerganov, slaren, and contributors) — for the inference engine, the CUDA backend, the MoE offload scheduler path, and the `-ot` override mechanism that made the `is_host=true` approach viable without forking the entire framework.
-- **NVIDIA** — for `cudaHostRegister` and the CUDA driver API that exposes PCIe DMA to userspace, and for the NV_C0B5 Copy Engine class that inspired the next phase of this work.
-- **The open-source LLM community** — for MoE architectures (Mixture of Experts) that make this offloading strategy possible by design.
+### Extreme Quantization & Compute
+
+| Project | What We Learned |
+|---------|-----------------|
+| **[3LTERN](https://github.com/ELX987/3LTERN)** (ELX987) | W1.58A8 (1.58-bit ternary) CUDA kernel for Pascal. 16 weights packed per uint32, branchless decode via `bit0 - bit1`, `__dp4a` instruction on sm_61. Future optimization path for compute-bound layers. |
+| **[Unsloth](https://huggingface.co/unsloth)** (Daniel & Michael) | Dynamic quantization formats (UD-Q2_K_XL) that are structurally superior to raw 1.58-bit. Ungated model distribution — their Qwen 3.6 releases don't require HF authentication. The model we target was quantized and distributed by them. |
+
+See `ARCHITECTURE_HISTORY.md` for the complete evolution.
