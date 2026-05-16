@@ -1,0 +1,170 @@
+# VITRIOL Roadmap
+
+> Current base: RAM Shot — page-locked host RAM for MoE expert weights (6.31 tok/s)
+
+---
+
+## Phase 3: CE DMA LRU Cache 🚧 (Current)
+
+**Goal**: Keep hot experts in a small VRAM pool → native VRAM speed on cache hit.
+**Estimated gain**: +10–50% over RAM Shot (6.31 → ~7–9 tok/s)
+
+### Design
+
+```
+Token → ids[] → {expert_7, expert_42}
+                    │
+                    ▼
+         ┌──────────────────────┐
+         │  LRU Cache Check     │
+         │  (VRAM pool, 500 MB) │
+         └──────┬───────────────┘
+                │
+        ┌───────┴───────┐
+        ▼               ▼
+    Cache HIT       Cache MISS
+        │               │
+        │        ┌──────┴──────────┐
+        │        │ CE DMA from     │
+        │        │ page-locked RAM │
+        │        │ → VRAM pool     │
+        │        │ Update LRU      │
+        │        └──────┬──────────┘
+        │               │
+        └───────┬───────┘
+                ▼
+        ┌──────────────────┐
+        │ Use VRAM pointer │
+        │ for MUL_MAT_ID   │
+        └──────────────────┘
+```
+
+### Implementation Plan
+
+1. **VRAM pool**: 512 MB `cuMemAlloc` in `vitriol_cuda_init()`
+2. **LRU tracker**: `unordered_map<expert_key, vram_offset>`
+3. **Hook in ggml_cuda_mul_mat_id**: Before expert loop, read `ids` tensor. For each active expert, check cache. On miss, CE DMA from host VITRIOL buffer → pool.
+4. **Override `src0_slice.data`**: Point to VRAM pool offset instead of host pointer.
+5. **Eviction**: LRU eviction when pool full.
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `vitriol-cuda-integration.h` | Add `vitriol_lru_ensure()` declaration |
+| `vitriol-cuda-integration.cpp` | LRU cache init, lookup, CE DMA load, eviction |
+| `ggml-cuda.cu` | Call `vitriol_lru_ensure()` in `ggml_cuda_mul_mat_id` |
+
+---
+
+## Phase 4: Graph Split Optimization (Next)
+
+**Goal**: Reduce from 17 splits to ~2–5 by making VITRIOL buffer appear more like a CUDA device buffer to the scheduler.
+**Estimated gain**: -3–10% latency (reduced copy overhead).
+
+### Approach
+
+Investigate why `is_host=true` causes 17 splits. Options:
+- Override additional buffer type hooks to simulate device buffer behavior
+- Check if `supports_buft` needs additional device identity
+- Examine scheduler split logic in `ggml-backend.cpp`
+
+---
+
+## Phase 5: io_uring + O_DIRECT (Future)
+
+**Goal**: Remove mmap memory pressure by reading expert data directly from NVMe into pre-pinned buffers. Frees page cache.
+**Estimated gain**: -10 GB system RAM (page cache), no perf change.
+
+### Approach
+
+- Open GGUF with `O_DIRECT`
+- Use `io_uring` to read expert slices into bounce buffers
+- CE DMA from bounce → VRAM cache (or keep in pin buffer for RAM Shot)
+
+---
+
+## Phase 6: Dual-GPU Speculative Decoding (Future)
+
+**Goal**: GTX 960 (2 GB) as draft model, 1070 Ti as target.
+**Estimated gain**: +50–100% tokens/s (speculative decoding speedup).
+
+### Approach
+
+- GTX 960 runs small draft model (e.g., Qwen2.5-1.5B)
+- 1070 Ti runs Qwen3.6-35B-A3B target
+- CE DMA streams expert data between GPUs for cross-validation
+
+---
+
+## Phase 7: Alka Orchestration (Future)
+
+**Goal**: High-level stream language for expert loading patterns.
+
+### Approach
+
+- Define Alka recipes for expert fetch patterns
+- Compile to CE DMA + FENCE operations
+- Coordinate multiple GPUs
+
+---
+
+## Milestone Timeline
+
+| Phase | Description | Est. Duration | Priority |
+|-------|-------------|---------------|----------|
+| **3** | CE DMA LRU Cache | 1–2 sessions | 🔴 High |
+| 4 | Graph Split Optimization | 1 session | 🟡 Medium |
+| 5 | io_uring + O_DIRECT | 2–3 sessions | 🟢 Low |
+| 6 | Dual-GPU Spec Decode | 3–5 sessions | 🟢 Low |
+| 7 | Alka Orchestration | 5+ sessions | 🟢 Low |
+
+## Current Session: Phase 3 — CE DMA LRU Cache
+
+### Code change plan
+
+**vitriol-cuda-integration.h additions:**
+```cpp
+#define VITRIOL_LRU_POOL_MB 512
+#define VITRIOL_EXPERT_SLOTS 64  // ~8 MB per slot for ~512 MB
+
+void vitriol_lru_init(void);
+CUdeviceptr vitriol_lru_ensure(int expert_idx, size_t expert_size, const void *host_data);
+```
+
+**vitriol-cuda-integration.cpp additions:**
+```cpp
+static CUdeviceptr g_lru_pool = 0;
+static size_t g_lru_pool_size = 512 * 1024 * 1024;
+static int g_lru_slots = 64;
+static size_t g_lru_slot_size = 0; // set on first call
+
+// LRU tracking
+static std::unordered_map<int, int> g_lru_map;  // expert_idx → slot_idx
+static std::list<int> g_lru_order;               // most-recently-used front
+static std::mutex g_lru_mtx;
+
+CUdeviceptr vitriol_lru_ensure(int expert_idx, size_t expert_size, const void *host_data) {
+    // 1. Calculate slot size from first call
+    // 2. Check cache map → hit? return pool + slot * slot_size
+    // 3. Miss? Find slot (evict LRU if needed)
+    // 4. CE DMA from host_data → pool + slot * slot_size
+    // 5. Update LRU order
+    // 6. Return VRAM pointer
+}
+```
+
+**ggml-cuda.cu modification in ggml_cuda_mul_mat_id:**
+```cpp
+// After src0_slice setup, before ggml_cuda_mul_mat:
+if (vitriol_is_stream_enabled()) {
+    CUdeviceptr vram_ptr = vitriol_lru_ensure(i02, src0_slice.nb[2], src0_slice.data);
+    if (vram_ptr) {
+        src0_slice.data = (void*)vram_ptr;  // Use VRAM pointer instead of host
+    }
+}
+```
+
+---
+
+*Last updated: 2026-05-16 16:00 CEST*
