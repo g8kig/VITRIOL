@@ -3,9 +3,9 @@
 <img src="assets/vitriol_logo.svg" alt="VITRIOL" width="200"/>
 
 *"Visita Interiora Terrae Rectificando Invenies Occultum Lapidem"*
+
 *(Visit the Interior of the Earth, by Rectifying you will find the Hidden Stone)*
 
----
 
 ## Quick Start
 
@@ -28,7 +28,6 @@ cd vitriol/llama.cpp && cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON \
 ./vitriol run
 ```
 
----
 
 ## What Is It
 
@@ -49,7 +48,6 @@ VITRIOL's insight: MoE models only activate ~2-8 out of 256 experts per token. T
 | System RAM used | 10 GB (page-locked, never swapped) |
 | VRAM used | ~1.3 GiB (base model + KV cache + compute) |
 
----
 
 ## How It Works
 
@@ -111,7 +109,6 @@ With VITRIOL:
 - KV cache + compute: ~225 MiB in VRAM
 - **Total VRAM: ~1.5 GiB** — leaving 6.5 GiB free for larger context or other workloads
 
----
 
 ## CLI Reference
 
@@ -150,8 +147,6 @@ Config persisted in `~/.vitriol/config`. Precedence: CLI flag > Config > Env var
 | **async** | Double-buffer prefetch on separate CUDA stream. Hides DMA latency behind compute. |
 | **off** | VITRIOL inactive. Falls through to normal llama.cpp (OOM on 8 GB GPU). |
 
----
-
 ## Performance
 
 | Metric | RAM Shot only | + LRU Cache |
@@ -165,7 +160,6 @@ Config persisted in `~/.vitriol/config`. Precedence: CLI flag > Config > Env var
 
 The model (11.44 GiB) does **not fit** in 8 GB VRAM without VITRIOL.
 
----
 
 ## Hardware Targets
 
@@ -205,8 +199,6 @@ The model (11.44 GiB) does **not fit** in 8 GB VRAM without VITRIOL.
 └──────────────────────────────────────────────────────────────┘
 ```
 
----
-
 ## Project Structure
 
 ```
@@ -229,17 +221,3 @@ The model (11.44 GiB) does **not fit** in 8 GB VRAM without VITRIOL.
 ├── MILESTONE_1.md           ← Failed approaches archive (7 approaches)
 └── MILESTONE_2.md           ← RAM Shot: success report
 ```
-
----
-
-## Philosophy
-
-**VITRIOL = Engine.** Raw DMA power. Hard-coded, dangerous, fast.
-
-**Alka = ECU.** Abstraction layer. Safe, repeatable, multi-device.
-
-Build the engine first. Let the friction prove why you need the computer.
-
----
-
-*"Visita Interiora Terrae Rectificando Invenies Occultum Lapidem"*
