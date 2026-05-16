@@ -136,8 +136,6 @@ Run options:
 
 Config persisted in `~/.vitriol/config`. Precedence: CLI flag > Config > Env var > Default.
 
----
-
 ## VITRIOL Modes
 
 | Mode | What it does |
@@ -170,8 +168,6 @@ The model (11.44 GiB) does **not fit** in 8 GB VRAM without VITRIOL.
 | RTX 3060 | 12 GB | ✅ Supported | More VRAM for larger KV cache |
 | RTX 4090 | 24 GB | ✅ Supported | PCIe 4.0 x16 → higher bandwidth |
 
----
-
 ## Compatibility
 
 ### Tested
@@ -190,8 +186,6 @@ The model (11.44 GiB) does **not fit** in 8 GB VRAM without VITRIOL.
 - **Intel GPUs (SYCL/oneAPI):** SYCL doesn't expose page-locked host DMA in the same way. The unified memory model on integrated GPUs also makes VITRIOL's trick unnecessary — there's no discrete PCIe bus to cross.
 - **Apple Silicon (Metal):** Unified memory architecture. CPU and GPU share the same physical RAM pool. VITRIOL provides no benefit — the entire model fits in unified memory if it fits at all.
 - **Nouveau (open-source NVIDIA driver):** Lacks `cudaHostRegister` equivalent. The GMMU page tables populated by the proprietary NVIDIA RM driver are required for PCIe DMA from system memory.
-
----
 
 ## Architecture
 
