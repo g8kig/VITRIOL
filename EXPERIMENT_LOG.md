@@ -201,23 +201,28 @@ VRAM first 64 bytes: 47 47 55 46 03 00 00 00 ...
 | Field | Value |
 |-------|-------|
 | **Date** | 2026-05-16 |
-| **Status** | ✅ Implemented — not yet tested |
-| **Commit** | `683122e49-dirty` |
+| **Status** | ✅ Implemented — tested (fast path) |
+| **Commit** | `683122e49-dirty` (llama.cpp) |
 
 **Approach**: On top of RAM Shot, add a small VRAM pool (~512 MB) for frequently-used expert weights. `cuMemcpyHtoDAsync` copies from page-locked host RAM to VRAM pool on cache miss. Dedicated LRU stream + `cuStreamWaitEvent` before matmul. Composite key `(tensor_base, expert_idx)` prevents cross-layer collisions.
 
-| Metric | Expected |
-|--------|----------|
-| VRAM pool | 512 MB (configurable via `VITRIOL_LRU_MB`) |
-| Eviction policy | LRU (list + hash map) |
-| DMA path | cuMemcpyHtoDAsync on dedicated stream |
-| Synchronization | cuEventRecord + cuStreamWaitEvent |
-| Fallback | Host RAM read on cache miss |
-| Slot sizing | Dynamic — reallocates if expert size changes |
-| Layer safety | Composite key `(tensor_base, expert_idx)` |
-| Fast-path prefetch | 💡 Skipped for now — fast paths use small batches |
+| Metric | Expected | Actual |
+|--------|----------|--------|
+| VRAM pool | 512 MB | Allocated lazily on first LRU call |
+| Generation | 10-50% over RAM Shot | 6.9 t/s (+9.4% over 6.31) |
+| Prompt eval | — | 22.4 t/s |
+| LRU cache usage | Slow path only | Fast path used (MMVQ with ids) |
+| Model | Qwen3.6-35B-A3B | Loaded with `-ngl 99` on 8 GB GPU |
 
-**Expected improvement over RAM Shot**: 10-50% on repeated expert access patterns.
+**Test command**:
+```bash
+CUDA_VISIBLE_DEVICES=0 VITRIOL_MODE=stream VITRIOL_LRU_MB=512 VITRIOL_VERBOSE=1 \
+  llama-cli -m Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf -ngl 99 -c 512 -n 8 -p "Hello" -t 4
+```
+
+**Fast-path note**: Generation uses MMVQ (batch ≤ 8) which reads experts directly from page-locked host RAM via PCIe DMA. LRU cache is only activated on the slow path (cuBLAS per-expert slices). The fast-path kernel accesses `src0->data` directly, not through per-expert slices, so the LRU pointer swap doesn't apply.
+
+**LRU cache testing**: Slow path not exercised with single-token generation. Would activate with larger batches or non-quantized types.
 
 **Configuration**:
 ```
@@ -241,7 +246,7 @@ VITRIOL_VERBOSE=1             # Log cache hits/misses/evictions
 | 6 | CE DMA alone | May 15 | ✅ Verified | — | — | Low |
 | 7 | CE DMA + buft | May 15 | ❌ Illegal access | — | 10 GB | Medium |
 | 8 | **RAM Shot** | **May 16** | **✅ Working** | **6.31** | **10 GB** | **Low** |
-| 9 | **LRU Cache** | **May 16** | **✅ Implemented** | **TBD** | **10 GB** | **Medium** |
+| 9 | **LRU Cache** | **May 16** | **✅ Tested (fast path)** | **6.9** | **10 GB** | **Medium** |
 
 *\* Baseline established with partial model that fit in VRAM.*
 
@@ -281,4 +286,4 @@ Model requirements:
 
 ---
 
-*Last updated: 2026-05-16 16:00 CEST*
+*Last updated: 2026-05-16 17:00 CEST*
