@@ -236,3 +236,23 @@ The model (11.44 GiB) does **not fit** in 8 GB VRAM without VITRIOL.
 ├── MILESTONE_1.md           ← Failed approaches archive (7 approaches)
 └── MILESTONE_2.md           ← RAM Shot: success report
 ```
+
+---
+
+## Ars Priori
+
+*"Visita Interiora Terrae Rectificando Invenies Occultum Lapidem"*
+
+The name VITRIOL is borrowed from alchemy — the universal solvent, the acid that breaks down base metals into their prima materia so they can be reconstituted as gold. It is also a backronym for the alchemist's maxim above: "Visit the Interior of the Earth, by Rectifying you will find the Hidden Stone."
+
+The parallel is intentional. Consumer GPUs are the base metal: abundant, capable, but VRAM-starved for modern models. VITRIOL is the solvent — it strips away the assumption that all weights must live in VRAM, exposing the hidden capacity underneath. The philosopher's stone, in this case, is a 35B MoE model running on an 8 GB GPU.
+
+**Alka**, the planned orchestration layer, takes its name from alkahest — the hypothetical universal solvent that alchemists sought after vitriol. Where VITRIOL dissolves the VRAM barrier for a single GPU, Alka will orchestrate across multiple GPUs, coordinating expert placement, speculative decoding, and DMA schedules across devices.
+
+---
+
+## Acknowledgements
+
+- **llama.cpp team** (ggerganov, slaren, and contributors) — for the inference engine, the CUDA backend, the MoE offload scheduler path, and the `-ot` override mechanism that made the `is_host=true` approach viable without forking the entire framework.
+- **NVIDIA** — for `cudaHostRegister` and the CUDA driver API that exposes PCIe DMA to userspace, and for the NV_C0B5 Copy Engine class that inspired the next phase of this work.
+- **The open-source LLM community** — for MoE architectures (Mixture of Experts) that make this offloading strategy possible by design.
