@@ -6,186 +6,149 @@
 
 (Visit the Interior of the Earth, by Rectifying you will find the Hidden Stone)
 
----
-
-<img src="assets/alka-logo.svg" alt="Alka" width="100"/>
-
-Powered by **Alka**
-
 ## What It Is
 
-VITRIOL runs large language models on **VRAM-constrained hardware** by streaming only the active MoE experts from disk to GPU, instead of loading the full model. The model never fully sits in memory.
+VITRIOL runs large MoE language models on **VRAM-constrained consumer GPUs** by keeping expert weights in **page-locked host system RAM** instead of VRAM. The GPU reads them over PCIe DMA during MUL_MAT_ID — no kernel modules, no PCI unbinding, no display crashes.
 
-**Current approach:** Copy Engine DMA — uses the GPU's own silicon DMA engine to pull expert weights directly from system memory into VRAM at PCIe 3.0 x16 speeds (~12 GB/s theoretical). No CPU copy, no kernel driver unbind, no display crashes. The GPU's internal `NV_C0B5` Copy Engine (Pascal) executes `MEM_TO_MEM` transfers while compute kernels run concurrently.
-
-**Previous approaches (archived):** PCI BIND (GMMU cold brick → `0xBAD0FBxx`), PAT side-load (kernel enforces cache type consistency), Nouveau init (mutual exclusion with nvidia), CUDA P2P (GeForce SKU lock). All documented in `MILESTONE_1.md`.
-
-**Origin:** Built and optimized on a GTX 1070 Ti (Pascal, 8GB) + i7-3770 (Ivy Bridge). The architecture generalizes to any CUDA-capable GPU where VRAM is the bottleneck.
-
----
-
-## Current Architecture
-
-```
-Model: Qwen3.6-35B-A3B (256 experts, 8 active/token, 2-bit quant)
-         │
-         ▼
-┌──────────────────────────────┐     ┌──────────────────┐
-│         GPU (8GB VRAM)       │     │   CPU / Host     │
-│  Embeddings + Attention      │     │  io_uring reads  │
-│  KV Cache                    │     │  experts from    │
-│  Expert Cache (~160 experts) │◄────│  GGUF into       │
-│  (Copy Engine streams on     │     │  pinned bounce   │
-│   cache miss)                │     │  buffers         │
-└──────────────────────────────┘     └──────────────────┘
-```
-
-**Key constraint:** GPU VRAM is 8GB. Full model is 8.8GB. Solution: don't load all 256 experts — only 8 are active per token, and an LRU cache of ~160 experts fits in VRAM alongside the base model.
-
----
-
-## Target Architecture
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│   Alka (Orchestration)                                        │
-│   FLOW = CE DMA, FENCE = metapage semaphore                   │
-├───────────────────────────────────────────────┬───────────────┤
-│   llama.cpp (Inference)                       │ VITRIOL (CE)  │
-│   Tokenization, KV cache, attention compute  │ vitriol_ce    │
-│                                                │ NVMe→VRAM CE  │
-│                                                │ DMA (doorbell)│
-├───────────────────────┬───────────────────────┴───────────────┤
-│     GPU (8GB)         │      SSD (NVMe)                       │
-│  Base model (always)  │   256 experts (on demand)              │
-│  Expert cache (~160)  │   12GB GGUF file                      │
-│  KV Cache             │   io_uring + O_DIRECT to bounce       │
-└───────────────────────┴───────────────────────────────────────┘
-```
-
----
-
-## Hardware (Development Platform)
-
-| Component | Model |
-|-----------|-------|
-| GPU (primary) | GTX 1070 Ti (Pascal, 8GB, device 1b82) |
-| CPU | i7-3770 (Ivy Bridge, no AVX2) |
-| GPU (secondary) | GTX 960 (2GB) — future draft model / speculative decoding |
-| Storage | NVMe SSD |
-
-## Model: Qwen3.6-35B-A3B
+**Current approach (RAM Shot):** mmap → mlock → cudaHostRegister → is_host=true. Expert weights live in system RAM, GPU reads them transparently over PCIe. Only ~3% slower than all-VRAM, and enables models that wouldn't otherwise fit.
 
 | Metric | Value |
 |--------|-------|
-| Architecture | MoE, 256 experts, 8 active/token |
-| Total params | 34.66 B |
-| Active per token | ~3B (8/256 experts) |
-| Quantization | UD-Q2_K_XL (2-bit) |
-| File size | 11.44 GiB |
+| Model | Qwen3.6-35B-A3B (34.66B, 256 MoE experts) |
+| GPU | GTX 1070 Ti (Pascal, 8 GB VRAM) |
+| Generation | **6.31 tok/s** |
+| VRAM saved | ~10 GB (experts stay in host RAM) |
+| System RAM used | 10 GB (page-locked, never swapped) |
+
+**Status:** ✅ Working — `VITRIOL_MODE=stream` on llama-server.
 
 ---
 
-## Running It
+## How It Works
 
-```bash
-# Source environment (or set variables manually)
-source vitriol.env
-
-# Embeddings + attention on GPU, 256 experts on CPU
-CUDA_VISIBLE_DEVICES="${VITRIOL_GPU:-0}" "$VITRIOL_LLAMA_SERVER" \
-    -m "$VITRIOL_MODEL_DIR/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf" \
-    -ngl 20 \
-    -ot ".*exps.*=CPU" \
-    --port "${VITRIOL_PORT:-8279}" \
-    --no-mmap \
-    -c 4096
+```
+VITRIOL buffer type (custom ggml_backend_buffer_type)
+  │
+  ├─ Allocation: mmap(10GB) → madvise(MADV_HUGEPAGE)
+  │              → mlock → cudaHostRegister
+  │
+  ├─ Model load: memcpy from GGUF → VITRIOL buffer (one-time copy)
+  │
+  └─ Inference:  GPU reads weights over PCIe DMA
+                 → 6.31 tok/s on GTX 1070 Ti
 ```
 
-See `RESOURCE_LOCATIONS.md` for all path configuration and `vitriol.env.example` for defaults.
+The VITRIOL buffer type (`vitriol-buffer.cpp`) allocates system RAM, page-locks it for GPU access, and reports `is_host=true` to llama.cpp's graph scheduler. The scheduler routes MUL_MAT_ID to the CUDA backend, which reads the weights transparently from host memory. No VRAM is used for expert weight storage.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+```bash
+# One-time: grant capability for mlock(10GB) + cudaHostRegister(10GB)
+sudo setcap cap_ipc_lock=+ep ./build/bin/llama-server
+
+# Build llama.cpp with VITRIOL
+cd llama.cpp/build
+cmake .. -DGGML_CUDA=ON
+make -j$(nproc) llama-server
+```
+
+### Run
+
+```bash
+CUDA_VISIBLE_DEVICES=0 VITRIOL_MODE=stream ./bin/llama-server \
+  -m /path/to/model.gguf \
+  -ngl 41 \
+  -c 2048 \
+  --port 8279
+```
+
+### Test
+
+```bash
+curl -X POST http://127.0.0.1:8279/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"...","messages":[{"role":"user","content":"Hello"}],"max_tokens":50}'
+```
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    GPU (GTX 1070 Ti, 8 GB VRAM)              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Base model (1.3 GiB)  │  KV Cache  │  Compute buffers │  │
+│  │  Embeddings, Attention,│  (512 ctx) │  (sched: ~215 MB)│  │
+│  │  RMS Norm, Output      │  (10 MB)   │                  │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                    ▲ PCIe DMA (~12 GB/s)                      │
+└────────────────────┼─────────────────────────────────────────┘
+                     │
+┌────────────────────┼─────────────────────────────────────────┐
+│           CPU / System RAM (DDR3, ~20 GB/s)                  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  VITRIOL buffer (10 GiB, page-locked, never swapped)   │  │
+│  │  256 expert weight tensors, 0% VRAM footprint           │  │
+│  │  mmap → madvise(HUGEPAGE) → mlock → cudaHostRegister    │  │
+│  └────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  GGUF mmap (11.44 GiB file, page cache)                │  │
+│  └────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  CE DMA (initialized, available for LRU cache)         │  │
+│  │  Bounce buffer: 256 MB, pre-pinned, stream ready       │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Project Structure
 
 ```
-├── alka-executor/
-│   ├── executor.c               # Alka stream executor (userspace)
-│   ├── vitriol_copy_engine.c    # NV_C0B5 Copy Engine DMA implementation
-│   ├── vitriol_copy_engine.h    # CE constants + API (from NVIDIA clc0b5.h)
-│   ├── vitriol_ce_test.c        # Standalone CE DMA verification
-│   ├── gguf-offset-resolver.c   # GGUF tensor offset parser
-│   └── vitriol_alka_user.h      # Alka ABI header (userspace)
-├── alka/
-│   ├── generated/               # Auto-generated .alka recipes
-│   ├── recipes/                 # Hand-written recipes
-│   ├── vials/                   # Hardware vials (.alkavl)
-│   └── results/                 # Benchmark results
-├── alka-handoff/                # Pre-compiled streams from Alka team
-├── docs/
-│   ├── COPY_ENGINE_PLAN.md      # CE implementation plan (doorbell path)
-│   ├── VITRIOL_GTX960_SETUP.md  # GTX 960 setup (archived)
-│   └── ALKA_EXECUTOR_DESIGN.md  # Executor + ABI documentation
-├── scripts/
-│   ├── generate-alka-recipe.sh  # GGUF → .alka recipe generator
-│   ├── benchmark_alka.sh        # Full benchmark pipeline
-│   ├── apply-llama-patches.sh   # Apply VITRIOL patches to llama.cpp
-│   └── build-llama-server.sh    # Build llama.cpp with CUDA
-├── vitriol-daemon/
-│   ├── vitriol.c                # Kernel module v0.2 (Alka ABI)
-│   └── vitriol_alka_kernel.h    # Alka ABI header (kernel)
-├── llama.cpp-patches/           # Unified diffs for llama.cpp
-├── llama.cpp/                   # git submodule (patched)
-├── include/
-│   ├── vitriol-moe-expert-parser.h   # Expert tensor parsing
-│   └── vitriol-expert-cache.h        # LRU cache for expert loading
-├── src/
-│   ├── vitriol-moe-expert-parser.cpp
-│   └── vitriol-expert-cache.cpp
-├── MILESTONE_1.md               # Full journey documentation
-├── MILESTONE_2.md               # (future) CE DMA integration in llama.cpp
-└── assets/                      # Logos, diagrams
+├── llama.cpp/
+│   └── ggml/src/ggml-cuda/
+│       ├── vitriol-buffer.{cpp,h}         ← RAM Shot buffer type
+│       ├── vitriol-cuda-integration.{cpp,h} ← Init, config, CE stub
+│       ├── vitriol_copy_engine.{cpp,h}    ← CE DMA implementation
+│       └── ggml-cuda.cu                   ← supports_buft + VITRIOL hooks
+├── alka-executor/                         ← CE DMA standalone test + executor
+├── docs/                                  ← Architecture docs
+├── scripts/                               ← Build & benchmark scripts
+├── MILESTONE_1.md                         ← Complete failure archive (7 approaches)
+├── MILESTONE_2.md                         ← RAM Shot: success report
+└── .opencode/plans/                       ← Implementation plans
 ```
 
 ---
 
-## Ars Priori & Acknowledgements
+## Performance
 
-VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe, metapage completion signaling, async expert prefetching, extreme quantization on legacy hardware — was reverse-engineered from the following works. We document our debt explicitly.
+| Metric | RAM Shot | Notes |
+|--------|----------|-------|
+| Prompt eval | 33.86 tok/s | 19 tokens in 561 ms |
+| Generation | **6.31 tok/s** | 30 tokens in 4.75 s |
+| VRAM used | **1.3 GiB** | 8 GiB free for other tasks |
+| System RAM | +10 GiB | Page-locked, never swapped |
+| Model load | ~64 s | 10 GB memcpy from GGUF |
 
-### Inference Engine
+The model (11.44 GiB) does **not fit** in 8 GB VRAM without VITRIOL.
 
-| Project | What We Learned |
-|---------|-----------------|
-| **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (ggml-org) | The core inference engine. GGUF format, CUDA backend, tensor loading pipeline. The `-ot` (override tensor) flag in PR #11397 was the breakthrough that enabled expert streaming. Our `vitriol-cuda-integration.cpp` hooks into `ggml-cuda.cu` at the tensor-copy boundary. |
-| **[GGUF Format](https://github.com/ggerganov/llama.cpp/blob/master/ggml/include/gguf.h)** | Binary model format with tensor offsets accessible via `gguf_get_tensor_offset()`, `gguf_get_tensor_name()`, `gguf_get_tensor_type()` — the foundation of our expert parser. |
-| **[PR #11397](https://github.com/ggerganov/llama.cpp/pull/11397)** (slaren) | Added `--override-tensor` (`-ot`) for per-tensor-type buffer placement. The exact mechanism we use: `-ot ".*exps.*=CPU"` keeps 8GB of experts on CPU while attention layers run on GPU. |
-| **[PR #11571](https://github.com/ggerganov/llama.cpp/pull/11571)** (fairydreaming) | Load-all-experts-during-warmup; `llama_set_warmup()` API for ensuring all expert tensors are resident before inference. |
-| **[PR #6387](https://github.com/ggerganov/llama.cpp/pull/6387)** (slaren) | Changed expert storage from per-expert tensors to a single 3D tensor — critical for our approach since all 256 experts are now in one contiguous block. |
+---
 
-### GPUDirect Storage & DMA
+## Hardware Targets
 
-| Project | What We Learned |
-|---------|-----------------|
-| **[gds-nvidia-fs](https://github.com/NVIDIA/gds-nvidia-fs)** (NVIDIA) | Official GPUDirect Storage source code. We studied `nvfs-core.c`, `nvfs-pci.c`, and `nvfs-dma.c` to understand: kiocb completion callbacks for NVMe, shared metapage (4KB) for fast completion signaling, `wmb()` memory barriers before DMA. |
-| **[open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules)** (NVIDIA) | NVIDIA's open kernel module source containing the exact NV_C0B5 class definition (`clc0b5.h`) for the Pascal DMA Copy Engine. Also `clb06f.h` (Maxwell Channel GPFIFO) for the UserD/GPFIFO/doorbell register interface. The Pushbuffer method format and LAUNCH_DMA bitflags were extracted from these headers. |
-| **[hw-nvdla](https://github.com/NVIDIA/hw-nvdla)** (NVIDIA) | Hardware DLA documentation for understanding direct memory access patterns on NVIDIA silicon. |
-
-### Async Scheduling & MoE Orchestration
-
-| Project | What We Learned |
-|---------|-----------------|
-| **[KTransformers](https://github.com/kvcache-ai/KTransformers)** (kvcache-ai) | YAML-based layer placement across CPU/GPU, double-buffer prefetch pattern (compute layer N while streaming N+1), MoE-specific async scheduling. KTransformers targets modern CPUs (AMX/AVX512); VITRIOL inverts this — GPU as primary compute, CPU as orchestrator only. |
-| **Qwen3.6-35B-A3B MoE** | 256 experts, 8 active per token — the exact sparsity architecture that makes expert streaming viable. The MoE router (`ffn_gate_inp`) determines which 8 experts to load; only those need to be in VRAM. |
-
-### Extreme Quantization & Compute
-
-| Project | What We Learned |
-|---------|-----------------|
-| **[3LTERN](https://github.com/ELX987/3LTERN)** (ELX987) | W1.58A8 (1.58-bit ternary) CUDA kernel for Pascal. 16 weights packed per uint32, branchless decode via `bit0 - bit1`, `__dp4a` instruction on sm_61. Future optimization path for compute-bound layers. |
-| **[Unsloth](https://huggingface.co/unsloth)** (Daniel & Michael) | Dynamic quantization formats (UD-Q2_K_XL) that are structurally superior to raw 1.58-bit. Ungated model distribution — their Qwen 3.6 releases don't require HF authentication. The model we target was quantized and distributed by them. |
-
-See `ARCHITECTURE_HISTORY.md` for the complete evolution.
+| GPU | VRAM | VITRIOL | Notes |
+|-----|------|---------|-------|
+| GTX 1070 Ti | 8 GB | ✅ Verified | PCIe 3.0 x16, 6.31 tok/s |
+| GTX 960 | 2 GB | ⚠️ Partial | CC 5.2 lacks kernel images for some ops |
+| RTX 3060 | 12 GB | ✅ Supported | More VRAM for larger KV cache |
+| RTX 4090 | 24 GB | ✅ Supported | PCIe 4.0 x16 → higher bandwidth |
 
 ---
 
