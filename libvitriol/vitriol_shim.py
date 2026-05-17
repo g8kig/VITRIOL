@@ -282,14 +282,32 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def sublimate_content(content: str) -> str:
+def sublimate_content(content) -> str:
     """
     Sublimation (Guardrail 2): Strip reasoning/tool bloat
     Converts bloated metadata into compact tokens
     """
     if not content:
         return ""
-    
+
+    # Handle OpenAI-style content lists (multimodal)
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get('type') == 'text':
+                    texts.append(part.get('text', ''))
+                elif part.get('type') == 'image_url' or part.get('type') == 'image':
+                    texts.append('[image]')
+                else:
+                    texts.append(str(part))
+            else:
+                texts.append(str(part))
+        content = '\n'.join(texts)
+
+    if not isinstance(content, str):
+        content = str(content)
+
     # Strip <reasoning> blocks
     content = re.sub(r'<reasoning>.*?</reasoning>', '[reasoning distilled]', content, flags=re.DOTALL)
     content = re.sub(r'reasoning_content:\s*.*?\n', '', content)
@@ -376,7 +394,16 @@ def rectify_context(messages: List[Dict[str, Any]], current_query: str = "", fro
         
         # Add as system message or append to existing system message
         if active_messages and active_messages[0].get('role') == 'system':
-            active_messages[0]['content'] += streamed_text
+            sc = active_messages[0]['content']
+            if isinstance(sc, str):
+                active_messages[0]['content'] = sc + streamed_text
+            elif isinstance(sc, list):
+                for part in sc:
+                    if isinstance(part, dict) and part.get('type') == 'text':
+                        part['text'] = part['text'] + streamed_text
+                        break
+                else:
+                    sc.append({"type": "text", "text": streamed_text})
         else:
             active_messages.insert(0, {'role': 'system', 'content': streamed_text})
     
@@ -494,7 +521,16 @@ def proxy_chat_completions():
             if memory_text.strip():
                 # Prepend as system message
                 if messages and messages[0].get('role') == 'system':
-                    messages[0]['content'] += "\n\n" + memory_text
+                    content = messages[0]['content']
+                    if isinstance(content, str):
+                        messages[0]['content'] = content + "\n\n" + memory_text
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get('type') == 'text':
+                                part['text'] = part['text'] + "\n\n" + memory_text
+                                break
+                        else:
+                            content.append({"type": "text", "text": memory_text})
                 else:
                     messages.insert(0, {'role': 'system', 'content': memory_text})
                 logger.info(
