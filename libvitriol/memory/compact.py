@@ -21,6 +21,14 @@ import os
 def format_episode(episode: dict, max_chars: Optional[int] = None) -> str:
     """Format an episode for injection. Truncates if max_chars set."""
     content = episode.get('content', '')
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, dict) and part.get('type') == 'text':
+                texts.append(part.get('text', ''))
+        content = ' '.join(texts)
+    elif not isinstance(content, str):
+        content = str(content)
     if max_chars and len(content) > max_chars:
         content = content[:max_chars] + '…'
 

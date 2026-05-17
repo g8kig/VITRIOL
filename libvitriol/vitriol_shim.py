@@ -342,8 +342,28 @@ def rectify_context(messages: List[Dict[str, Any]], current_query: str = "", fro
         return messages, RectificationStats(0, 0, 0, False, 0.0)
     
     original_messages = messages.copy()
+    def _content_str(m):
+        c = m.get('content', '')
+        if isinstance(c, list):
+            texts = []
+            for part in c:
+                if isinstance(part, dict) and part.get('type') == 'text':
+                    texts.append(part.get('text', ''))
+            c = ' '.join(texts)
+        elif not isinstance(c, str):
+            c = str(c)
+        r = m.get('reasoning_content', '')
+        if isinstance(r, list):
+            texts = []
+            for part in r:
+                if isinstance(part, dict) and part.get('type') == 'text':
+                    texts.append(part.get('text', ''))
+            r = ' '.join(texts)
+        elif not isinstance(r, str):
+            r = str(r)
+        return c + r
     original_tokens = sum(
-        estimate_tokens(m.get('content', '') + m.get('reasoning_content', ''))
+        estimate_tokens(_content_str(m))
         for m in messages
     )
     
@@ -431,7 +451,7 @@ def rectify_context(messages: List[Dict[str, Any]], current_query: str = "", fro
     
     # Calculate final token count
     rectified_tokens = sum(
-        estimate_tokens(m.get('content', ''))
+        estimate_tokens(_content_str(m))
         for m in messages
     )
     
@@ -493,7 +513,15 @@ def proxy_chat_completions():
         # Extract current query for context streaming
         current_query = ""
         if messages and messages[-1].get('role') == 'user':
-            current_query = messages[-1].get('content', '')[:500]  # First 500 chars as query
+            raw = messages[-1].get('content', '')
+            if isinstance(raw, list):
+                texts = []
+                for part in raw:
+                    if isinstance(part, dict) and part.get('type') == 'text':
+                        texts.append(part.get('text', ''))
+                current_query = ' '.join(texts)[:500]
+            elif isinstance(raw, str):
+                current_query = raw[:500]
         
         # ── Emulated Memory Intercept ──
         memory_candidates = []  # for post-response Hebbian update
