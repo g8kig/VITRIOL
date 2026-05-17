@@ -16,6 +16,7 @@ import json
 import re
 import os
 import time
+import threading
 import subprocess
 import requests
 import logging
@@ -612,26 +613,65 @@ def proxy_chat_completions():
 def _proxy_stream(backend_resp, req, memory_candidates, current_query):
     """Proxy SSE stream from llama-server back to client, then store the turn."""
 
+    collected = [""]
+
     def generate():
-        collected = ""
         try:
             for chunk in backend_resp.iter_content(chunk_size=None):
                 if chunk:
                     decoded = chunk.decode('utf-8', errors='replace')
-                    collected += decoded
-                    # Log progress from llama-server SSE events
+                    collected[0] += decoded
                     for line in decoded.split('\n'):
                         if '"progress"' in line or '"tokens_per_second"' in line:
                             logger.info(f"llama-server: {line.strip()}")
                     yield decoded
         finally:
-            # After the stream ends, store the conversation turn
             if MEMORY_MODE:
-                _store_turn(backend_resp.status_code, collected, req, memory_candidates, current_query)
+                t = threading.Thread(
+                    target=_store_turn_from_sse,
+                    args=(backend_resp.status_code, collected[0], req,
+                          memory_candidates, current_query),
+                    daemon=True,
+                )
+                t.start()
 
     return Response(stream_with_context(generate()),
                     mimetype='text/event-stream',
                     headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+def _store_turn_from_sse(status_code, sse_data, req, memory_candidates, current_query):
+    """Extract the final response from SSE data and store the turn."""
+    import json
+    if status_code != 200 or not MEMORY_MODE:
+        return
+    # Extract the last JSON object from SSE data: lines like "data: {...}"
+    last_obj = None
+    for line in sse_data.split('\n'):
+        if line.startswith('data: ') and line != 'data: [DONE]':
+            try:
+                last_obj = json.loads(line[6:])
+            except Exception:
+                pass
+    _store_turn(status_code, json.dumps(last_obj) if last_obj else '{}',
+                req, memory_candidates, current_query)
+
+
+def _store_turn_from_sse(status_code, sse_data, req, memory_candidates, current_query):
+    """Extract the final response from SSE data and store the turn."""
+    import json
+    if status_code != 200 or not MEMORY_MODE:
+        return
+    # Extract the last JSON object from SSE data: lines like "data: {...}"
+    last_obj = None
+    for line in sse_data.split('\n'):
+        if line.startswith('data: ') and line != 'data: [DONE]':
+            try:
+                last_obj = json.loads(line[6:])
+            except Exception:
+                pass
+    _store_turn(status_code, json.dumps(last_obj) if last_obj else '{}',
+                req, memory_candidates, current_query)
 
 
 def _proxy_buffered(backend_resp, req, memory_candidates, current_query):
