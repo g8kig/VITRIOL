@@ -447,4 +447,33 @@ Three hooks in the MoE matmul path:
 
 ---
 
-*Last updated: 2026-05-17 19:00 CEST*
+## Experiment 14: Graph Split Optimization (Planned — Deferred)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-05-17 |
+| **Status** | 💡 Analysis done — implementation deferred until end-to-end validation |
+
+### Context
+
+VITRIOL currently produces 17 graph splits at 6.9 tok/s (`GGML_SCHED_DEBUG=1`). The all-VRAM baseline produces 2. Each split adds scheduling overhead + cross-backend tensor copies.
+
+### Root Cause (Hypothesized)
+
+The `vitriol_is_vitriol_buffer_type()` check in `ggml_backend_cuda_device_supports_buft()` (line 5285) already returns true. However, `tensor_backend_id()` for VITRIOL-buffer tensors may return a different ID than the CUDA backend, causing the scheduler (Pass 5, lines 1272-1301) to create a new split when it encounters the first VITRIOL-weighted op after a CUDA-op run.
+
+The `GGML_SCHED_MAX_SPLIT_INPUTS` (30) limit per split may also be hit when 8+ expert weights cross backend boundaries per MoE layer.
+
+### To Investigate
+
+1. Run `GGML_SCHED_DEBUG=1` to confirm 17 splits and identify where they occur
+2. Check if `ggml_backend_buft_is_cuda_host()` should return true for VITRIOL buft (it IS page-locked host RAM, same as CUDA host buft)
+3. If confirmed: increase `GGML_SCHED_MAX_SPLIT_INPUTS` to 256 when VITRIOL is active, or make `vitriol_get_buffer_type()` share the CUDA host buft identity
+
+### Mitigation
+
+Predictive Prefetching (§5) hides DMA latency regardless of split count, making this less critical. Deferred until end-to-end test validates remaining bottleneck.
+
+---
+
+*Last updated: 2026-05-17 19:30 CEST*
