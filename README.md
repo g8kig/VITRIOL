@@ -46,6 +46,8 @@ All flags can be set via CLI flag, env var, or the TUI (`vitriol config`).
 
 **Full reference:** [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) — every flag explained with trade-offs, use cases, and recommended combinations.
 
+**OpenCode setup:** [`docs/OPENCODE_SETUP.md`](docs/OPENCODE_SETUP.md) — configuring VITRIOL as an OpenCode provider, why `vitriol setup` is required, workflow recommendations.
+
 **Test results:** [`docs/TEST_REPORT_2026-05-17.md`](docs/TEST_REPORT_2026-05-17.md) — measured tok/s, VRAM savings, and bug fixes.
 
 
