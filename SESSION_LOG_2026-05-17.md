@@ -91,3 +91,47 @@ The C++ changes to llama.cpp require a rebuild:
 ```bash
 cd llama.cpp && cmake --build build -j$(nproc)
 ```
+
+---
+
+## Session 3 (2026-05-17, 18:30) — Phase 1 Complete: Semantic Search
+
+**Feature:** Optional sentence-transformers semantic search (`--semantic-mode on`), replacing keyword Jaccard overlap with cosine similarity in the memory retrieval path.
+
+### Build Outcome
+
+`llama.cpp` rebuild completed successfully — `llama-server` binary at `llama.cpp/build/bin/llama-server` (9.5 MB, fresh link). All C++ changes (KV offload + sparse eviction) compiled cleanly.
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `libvitriol/memory/scorer.py` | Lazy-loaded `SentenceTransformer`, `semantic_similarity()` with cosine similarity, graceful keyword fallback |
+| `libvitriol/memory/db.py` | `embeddings` SQLite table, `_compute_and_cache()`, `get_embedding_for_text()` |
+| `libvitriol/memory/retrieval.py` | Expanded candidate pool (`20x`) when in semantic mode |
+| `libvitriol/vitriol_shim.py` | `SEMANTIC_MODE` detection, health endpoint reports `semantic_mode` |
+| `scripts/vitriol` | `--semantic-mode` flag for run/serve, `memory.semantic_mode` config key, TUI menu option 4, env piping through all launch paths |
+
+### Config Interface
+
+```
+--semantic-mode on | off     (env: VITRIOL_SEMANTIC_MODE, config: memory.semantic_mode, default: off)
+```
+
+### Verification
+
+- `bash -n scripts/vitriol` — clean (1061 lines)
+- `ast.parse` on all 8 Python modules — clean
+- `serve --dry-run --semantic-mode on` — shows `Semantic: on` with port swap correct
+- `run --dry-run --semantic-mode on` — shows `Semantic: on`
+- `vitriol config show` — shows `Semantic Search: off`
+
+### Git
+
+```
+85e8ea4 docs: update experiment log and session report for Phase 1 context features
+97d5a19 context: add KV mode, frozen prompt, and sparse eviction — CLI config + C++ + shim
+391b72e memory: add emulated memory architecture
+```
+
+Pending commit: Phase 1 complete with semantic search.

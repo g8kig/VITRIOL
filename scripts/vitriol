@@ -35,6 +35,7 @@ DEFAULT_VERBOSE=false
 DEFAULT_MEMORY_MODE="off"
 DEFAULT_KV_MODE="standard"
 DEFAULT_FROZEN_PROMPT="off"
+DEFAULT_SEMANTIC_MODE="off"
 
 # ── config vars (set by parse_config) ────────────────────────────
 CFG_DEVICE="$DEFAULT_DEVICE"
@@ -52,6 +53,7 @@ CFG_PARALLEL="$DEFAULT_PARALLEL"
 CFG_MEMORY_MODE="$DEFAULT_MEMORY_MODE"
 CFG_KV_MODE="$DEFAULT_KV_MODE"
 CFG_FROZEN_PROMPT="$DEFAULT_FROZEN_PROMPT"
+CFG_SEMANTIC_MODE="$DEFAULT_SEMANTIC_MODE"
 
 # ═════════════════════════════════════════════════════════════════
 # CONFIG PARSING
@@ -91,6 +93,7 @@ parse_config() {
                 server.parallel)       CFG_PARALLEL="$val" ;;
                 server.port)           CFG_PORT="$val" ;;
                 memory.mode)           CFG_MEMORY_MODE="$val" ;;
+                memory.semantic_mode)  CFG_SEMANTIC_MODE="$val" ;;
                 kv.mode)               CFG_KV_MODE="$val" ;;
                 frozen_prompt)         CFG_FROZEN_PROMPT="$val" ;;
             esac
@@ -140,6 +143,8 @@ parallel = $CFG_PARALLEL
 [memory]
 # Emulated memory mode: on | off
 mode = $CFG_MEMORY_MODE
+# Semantic search mode: on | off (requires sentence-transformers)
+semantic_mode = $CFG_SEMANTIC_MODE
 
 [kv]
 # KV cache mode: standard | offload | sparse
@@ -185,6 +190,7 @@ config_show() {
     print_row "Verbose:               " "${CFG_VERBOSE}"
     echo "╠$(printf '─%.0s' $(seq 1 $box_w))╣"
     print_row "Memory Mode:           " "${CFG_MEMORY_MODE}"
+    print_row "  Semantic Search:     " "${CFG_SEMANTIC_MODE}"
     print_row "KV Mode:               " "${CFG_KV_MODE}"
     print_row "Frozen Prompt:         " "${CFG_FROZEN_PROMPT}"
     echo "╠$(printf '─%.0s' $(seq 1 $box_w))╣"
@@ -227,6 +233,7 @@ config_set() {
         server.parallel)       CFG_PARALLEL="$val" ;;
         server.port)           CFG_PORT="$val" ;;
         memory.mode)           CFG_MEMORY_MODE="$val" ;;
+        memory.semantic_mode)  CFG_SEMANTIC_MODE="$val" ;;
         kv.mode)               CFG_KV_MODE="$val" ;;
         frozen_prompt)         CFG_FROZEN_PROMPT="$val" ;;
         *) echo "Unknown key: $key"; return 1 ;;
@@ -389,7 +396,7 @@ tui_vitriol_menu() {
         printf "║  %-37s ║\n" "q) Quit"
         echo "╚══════════════════════════════════════════╝"
         echo ""
-        read -r -p "Select [1-3/b/q]: " choice
+        read -r -p "Select [1-4/b/q]: " choice
         case "$choice" in
             1)
                 echo "Modes: stream (RAM Shot + LRU) | sync | async | off"
@@ -430,11 +437,12 @@ tui_memory_menu() {
         printf "║  %-37s ║\n" "1) Memory Mode      [${CFG_MEMORY_MODE}]"
         printf "║  %-37s ║\n" "2) KV Mode           [${CFG_KV_MODE}]"
         printf "║  %-37s ║\n" "3) Frozen Prompt     [${CFG_FROZEN_PROMPT}]"
+        printf "║  %-37s ║\n" "4) Semantic Search   [${CFG_SEMANTIC_MODE}]"
         printf "║  %-37s ║\n" "b) Back to Main Menu"
         printf "║  %-37s ║\n" "q) Quit"
         echo "╚══════════════════════════════════════════╝"
         echo ""
-        read -r -p "Select [1-3/b/q]: " choice
+        read -r -p "Select [1-4/b/q]: " choice
         case "$choice" in
             1)
                 echo "Modes: on (emulated memory) | off (direct)"
@@ -460,6 +468,14 @@ tui_memory_menu() {
                     *) echo "Invalid mode"; sleep 1 ;;
                 esac
                 ;;
+            4)
+                echo "Options: on (semantic search via sentence-transformers) | off (keyword search)"
+                read -r -p "Enter mode: " val
+                case "$val" in
+                    on|off) config_set memory.semantic_mode "$val" ;;
+                    *) echo "Invalid mode"; sleep 1 ;;
+                esac
+                ;;
             b|B) return ;;
             q|Q) clear; exit 0 ;;
         esac
@@ -480,7 +496,7 @@ tui_server_menu() {
         printf "║  %-37s ║\n" "q) Quit"
         echo "╚══════════════════════════════════════════╝"
         echo ""
-        read -r -p "Select [1-3/b/q]: " choice
+        read -r -p "Select [1-4/b/q]: " choice
         case "$choice" in
             1)
                 read -r -p "Enter host address: " val
@@ -550,11 +566,12 @@ Run options:
   -t N               CPU threads
   -ngl N             GPU layers to offload
   -lru MB            LRU VRAM cache size
-  --memory-mode MODE emulated memory: on | off
-  --kv-mode MODE     KV cache: standard | offload | sparse
-  --frozen-prompt M  frozen prompt caching: on | off
-  --verbose          enable debug logging
-  --dry-run          print config without launching
+  --memory-mode MODE   emulated memory: on | off
+  --kv-mode MODE       KV cache: standard | offload | sparse
+  --frozen-prompt M    frozen prompt caching: on | off
+  --semantic-mode M    semantic search: on | off (requires sentence-transformers)
+  --verbose            enable debug logging
+  --dry-run            print config without launching
 
 Serve options:
   -m PATH            model file path
@@ -565,10 +582,11 @@ Serve options:
   --host ADDR        bind address (default: $DEFAULT_HOST)
   -port N            server port (default: $DEFAULT_PORT)
   -p N               parallel slots (default: $DEFAULT_PARALLEL)
-  --memory-mode MODE emulated memory: on | off
-  --kv-mode MODE     KV cache: standard | offload | sparse
-  --frozen-prompt M  frozen prompt caching: on | off
-  --detach           run server in background
+  --memory-mode MODE   emulated memory: on | off
+  --kv-mode MODE       KV cache: standard | offload | sparse
+  --frozen-prompt M    frozen prompt caching: on | off
+  --semantic-mode M    semantic search: on | off (requires sentence-transformers)
+  --detach             run server in background
   --verbose          enable debug logging
   --dry-run          print config without launching
 
@@ -599,6 +617,7 @@ case "$CMD" in
         CLI_MEMORY_MODE=""
         CLI_KV_MODE=""
         CLI_FROZEN_PROMPT=""
+        CLI_SEMANTIC_MODE=""
         DRY_RUN=false
 
         while [[ $# -gt 0 ]]; do
@@ -612,6 +631,7 @@ case "$CMD" in
                 --memory-mode) CLI_MEMORY_MODE="$2"; shift 2 ;;
                 --kv-mode) CLI_KV_MODE="$2"; shift 2 ;;
                 --frozen-prompt) CLI_FROZEN_PROMPT="$2"; shift 2 ;;
+                --semantic-mode) CLI_SEMANTIC_MODE="$2"; shift 2 ;;
                 --verbose) CLI_VERBOSE="true"; shift ;;
                 --dry-run) DRY_RUN=true; shift ;;
                 -h|--help) usage; exit 0 ;;
@@ -630,6 +650,7 @@ case "$CMD" in
         MEMORY_MODE="${VITRIOL_MEMORY_MODE:-${CLI_MEMORY_MODE:-${CFG_MEMORY_MODE}}}"
         KV_MODE="${VITRIOL_KV_MODE:-${CLI_KV_MODE:-${CFG_KV_MODE}}}"
         FROZEN_PROMPT="${VITRIOL_FROZEN_PROMPT:-${CLI_FROZEN_PROMPT:-${CFG_FROZEN_PROMPT}}}"
+        SEMANTIC_MODE="${VITRIOL_SEMANTIC_MODE:-${CLI_SEMANTIC_MODE:-${CFG_SEMANTIC_MODE}}}"
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -664,6 +685,7 @@ case "$CMD" in
         MODEL_SIZE=$(stat --format=%s "$MODEL" 2>/dev/null | numfmt --to=iec || echo "?")
 
         MEMORY_MODE="${VITRIOL_MEMORY_MODE:-${CFG_MEMORY_MODE}}"
+        SEMANTIC_MODE="${VITRIOL_SEMANTIC_MODE:-${CFG_SEMANTIC_MODE}}"
 
         # Print launch banner
         clear
@@ -675,9 +697,10 @@ case "$CMD" in
         echo "  Mode:        $MODE (RAM Shot + LRU cache)"
         [[ "$LRU_MB" -gt 0 ]] && echo "  LRU:         $LRU_MB MB VRAM cache"
         echo "  GPU:         Device $DEVICE (GTX 1070 Ti)"
-        echo "  Memory Mode: $MEMORY_MODE"
+        echo "  Memory:      $MEMORY_MODE"
         echo "  KV Mode:     $KV_MODE"
         echo "  Frozen:      $FROZEN_PROMPT"
+        echo "  Semantic:    $SEMANTIC_MODE"
         echo "  Binary:      $BINARY"
         echo "  Port:        $PORT"
         [[ "$VERBOSE" == "true" ]] && echo "  Logging:     verbose"
@@ -702,6 +725,7 @@ case "$CMD" in
             VITRIOL_MEMORY_MODE="$MEMORY_MODE" \
             VITRIOL_KV_MODE="$KV_MODE" \
             VITRIOL_FROZEN_PROMPT="$FROZEN_PROMPT" \
+            VITRIOL_SEMANTIC_MODE="$SEMANTIC_MODE" \
             $ENV_VERBOSE \
             "$BINARY" \
             -m "$MODEL" \
@@ -726,6 +750,7 @@ case "$CMD" in
         CLI_MEMORY_MODE=""
         CLI_KV_MODE=""
         CLI_FROZEN_PROMPT=""
+        CLI_SEMANTIC_MODE=""
         DETACH=false
         DRY_RUN=false
 
@@ -742,6 +767,7 @@ case "$CMD" in
                 --memory-mode) CLI_MEMORY_MODE="$2"; shift 2 ;;
                 --kv-mode) CLI_KV_MODE="$2"; shift 2 ;;
                 --frozen-prompt) CLI_FROZEN_PROMPT="$2"; shift 2 ;;
+                --semantic-mode) CLI_SEMANTIC_MODE="$2"; shift 2 ;;
                 --detach) DETACH=true; shift ;;
                 --verbose) CLI_VERBOSE="true"; shift ;;
                 --dry-run) DRY_RUN=true; shift ;;
@@ -762,6 +788,7 @@ case "$CMD" in
         MEMORY_MODE="${VITRIOL_MEMORY_MODE:-${CLI_MEMORY_MODE:-${CFG_MEMORY_MODE}}}"
         KV_MODE="${VITRIOL_KV_MODE:-${CLI_KV_MODE:-${CFG_KV_MODE}}}"
         FROZEN_PROMPT="${VITRIOL_FROZEN_PROMPT:-${CLI_FROZEN_PROMPT:-${CFG_FROZEN_PROMPT}}}"
+        SEMANTIC_MODE="${VITRIOL_SEMANTIC_MODE:-${CLI_SEMANTIC_MODE:-${CFG_SEMANTIC_MODE}}}"
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -805,6 +832,7 @@ case "$CMD" in
         echo "  Memory:      $MEMORY_MODE"
         echo "  KV Mode:     $KV_MODE"
         echo "  Frozen:      $FROZEN_PROMPT"
+        echo "  Semantic:    $SEMANTIC_MODE"
         if [[ "$MEMORY_MODE" == "on" ]]; then
             LLAMA_PORT=$((PORT - 1))
             echo "  Server:      http://${HOST}:${LLAMA_PORT} (llama-server, internal)"
@@ -838,6 +866,7 @@ case "$CMD" in
                     VITRIOL_LRU_MB="$LRU_MB" \
                     VITRIOL_KV_MODE="$KV_MODE" \
                     VITRIOL_FROZEN_PROMPT="$FROZEN_PROMPT" \
+                    VITRIOL_SEMANTIC_MODE="$SEMANTIC_MODE" \
                     $ENV_VERBOSE \
                     nohup "$SERVER_BINARY" \
                         -m "$MODEL" \
@@ -857,6 +886,7 @@ case "$CMD" in
                     VITRIOL_MEMORY_MODE=on \
                     VITRIOL_KV_MODE="$KV_MODE" \
                     VITRIOL_FROZEN_PROMPT="$FROZEN_PROMPT" \
+                    VITRIOL_SEMANTIC_MODE="$SEMANTIC_MODE" \
                     LLAMA_API_URL="http://${HOST}:${LLAMA_PORT}/v1/chat/completions" \
                     LLAMA_STATUS_URL="http://${HOST}:${LLAMA_PORT}/health" \
                     SHIM_PORT="$PORT" \
@@ -872,6 +902,7 @@ case "$CMD" in
                     VITRIOL_LRU_MB="$LRU_MB" \
                     VITRIOL_KV_MODE="$KV_MODE" \
                     VITRIOL_FROZEN_PROMPT="$FROZEN_PROMPT" \
+                    VITRIOL_SEMANTIC_MODE="$SEMANTIC_MODE" \
                     $ENV_VERBOSE \
                     nohup "$SERVER_BINARY" \
                         -m "$MODEL" \
@@ -909,6 +940,7 @@ case "$CMD" in
                     VITRIOL_LRU_MB="$LRU_MB" \
                     VITRIOL_KV_MODE="$KV_MODE" \
                     VITRIOL_FROZEN_PROMPT="$FROZEN_PROMPT" \
+                    VITRIOL_SEMANTIC_MODE="$SEMANTIC_MODE" \
                     $ENV_VERBOSE \
                     "$SERVER_BINARY" \
                         -m "$MODEL" \
@@ -931,6 +963,7 @@ case "$CMD" in
                     VITRIOL_MEMORY_MODE=on \
                     VITRIOL_KV_MODE="$KV_MODE" \
                     VITRIOL_FROZEN_PROMPT="$FROZEN_PROMPT" \
+                    VITRIOL_SEMANTIC_MODE="$SEMANTIC_MODE" \
                     LLAMA_API_URL="http://${HOST}:${LLAMA_PORT}/v1/chat/completions" \
                     LLAMA_STATUS_URL="http://${HOST}:${LLAMA_PORT}/health" \
                     SHIM_PORT="$PORT" \
@@ -942,6 +975,7 @@ case "$CMD" in
                     VITRIOL_LRU_MB="$LRU_MB" \
                     VITRIOL_KV_MODE="$KV_MODE" \
                     VITRIOL_FROZEN_PROMPT="$FROZEN_PROMPT" \
+                    VITRIOL_SEMANTIC_MODE="$SEMANTIC_MODE" \
                     $ENV_VERBOSE \
                     "$SERVER_BINARY" \
                     -m "$MODEL" \

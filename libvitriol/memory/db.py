@@ -3,8 +3,10 @@ VITRIOL Emulated Memory — Database Layer
 
 SQLite-backed persistent memory per project. Each project gets its own
 .vitriol/memory.db file, automatically created on first access.
+Optionally caches sentence-transformer embeddings for semantic search.
 """
 
+import hashlib
 import sqlite3
 import os
 import threading
@@ -92,8 +94,79 @@ def _init_db(conn: sqlite3.Connection):
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS embeddings (
+            content_hash TEXT PRIMARY KEY,
+            content_type TEXT NOT NULL,
+            vector BLOB NOT NULL,
+            created_at   TEXT DEFAULT (datetime('now'))
+        );
     """)
     conn.commit()
+
+
+# ── Embedding Cache (for semantic search) ─────────────────────────
+
+_SEMANTIC_MODE = os.environ.get('VITRIOL_SEMANTIC_MODE', 'off').lower() == 'on'
+
+
+def _content_hash(content: str) -> str:
+    """SHA-256 hex digest of content for embedding cache key."""
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+
+def _get_cached_embedding(conn, content_hash: str) -> Optional[bytes]:
+    """Retrieve cached embedding blob by content hash."""
+    cursor = conn.execute(
+        "SELECT vector FROM embeddings WHERE content_hash = ?",
+        (content_hash,)
+    )
+    row = cursor.fetchone()
+    return row['vector'] if row else None
+
+
+def _store_cached_embedding(conn, content_hash: str,
+                            content_type: str, vector: bytes):
+    """Store or update an embedding blob."""
+    conn.execute(
+        "INSERT OR REPLACE INTO embeddings (content_hash, content_type, vector) VALUES (?, ?, ?)",
+        (content_hash, content_type, vector)
+    )
+
+
+def _compute_and_cache(conn, content: str, content_type: str = 'episode') -> Optional[bytes]:
+    """
+    Compute embedding, cache it, return serialised bytes.
+    Returns None if semantic mode is off or sentence-transformers unavailable.
+    """
+    if not _SEMANTIC_MODE:
+        return None
+    try:
+        from .scorer import _encode
+        emb = _encode(content)
+        if emb is None:
+            return None
+        import numpy as np
+        blob = np.array(emb, dtype='float32').tobytes()
+        ch = _content_hash(content)
+        _store_cached_embedding(conn, ch, content_type, blob)
+        return blob
+    except Exception:
+        return None
+
+
+def get_embedding_for_text(content: str) -> Optional[list]:
+    """
+    Public helper: retrieve or compute an embedding for arbitrary text.
+    Returns a list of floats, or None if unavailable.
+    """
+    if not _SEMANTIC_MODE:
+        return None
+    from .scorer import _encode
+    emb = _encode(content)
+    if emb is None:
+        return None
+    return list(emb)
 
 
 def get_or_create_session(project_id: str, session_id: str) -> dict:

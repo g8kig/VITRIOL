@@ -376,4 +376,41 @@ Available via CLI flag, env var (`VITRIOL_KV_MODE`, `VITRIOL_FROZEN_PROMPT`), an
 
 ---
 
-*Last updated: 2026-05-17 18:00 CEST*
+## Experiment 12: Semantic Search (`--semantic-mode on`)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-05-17 |
+| **Approach** | Optional sentence-transformers (`all-MiniLM-L6-v2`) for cosine similarity retrieval, replacing Jaccard keyword overlap |
+| **Status** | 💡 Implemented, untested (no end-to-end run yet) |
+
+### Implementation
+
+Three-layer integration:
+
+1. **`memory/scorer.py`** — lazy-loaded `SentenceTransformer` model, `semantic_similarity()` computes cosine similarity via numpy. Falls back to `keyword_overlap()` if sentence-transformers not installed. `compute_score()` now calls `semantic_similarity()` when `VITRIOL_SEMANTIC_MODE=on`.
+
+2. **`memory/db.py`** — optional `embeddings` SQLite table caches computed embeddings keyed by SHA-256 content hash. `_compute_and_cache()` stores float32 blobs. `get_embedding_for_text()` public helper for external use.
+
+3. **`memory/retrieval.py`** — candidate pool expanded to `20x` top_k when in semantic mode (vs `10x` for keyword) to allow full ranking over more candidates.
+
+### CLI Interface
+
+```
+--semantic-mode on | off     (env: VITRIOL_SEMANTIC_MODE, default: off)
+```
+
+Available via CLI flag, env var, config key `memory.semantic_mode`, and TUI (option 4 in Context & Memory Settings).
+
+### Notes
+
+- Depends on `sentence-transformers` and `numpy` Python packages (not installed by default).
+- First inference after mode is toggled on will download the `all-MiniLM-L6-v2` model (~80 MB).
+- Embedding cache lives in each project's `memory.db` so it persists across sessions.
+- The `vector_store.py` module (separate FAISS-based archival context streaming) is NOT replaced — this enhances the episodic memory retrieval path only.
+
+**Modified:** `memory/scorer.py`, `memory/db.py`, `memory/retrieval.py`, `vitriol_shim.py` (health endpoint), `scripts/vitriol` (CLI + config + TUI + env piping).
+
+---
+
+*Last updated: 2026-05-17 18:30 CEST*

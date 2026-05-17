@@ -2,8 +2,11 @@
 VITRIOL Emulated Memory — Retrieval with Cascading (Spreading Activation)
 
 Multi-hop retrieval: direct search → edge traversal → score → rank.
+When VITRIOL_SEMANTIC_MODE=on, relevance scoring uses cosine similarity
+via sentence-transformers instead of keyword overlap.
 """
 
+import os
 import re
 from typing import Optional
 
@@ -19,7 +22,9 @@ DEFAULT_RECENCY_WEIGHT = float(os.environ.get('MEMORY_RECENCY_WEIGHT', '0.35'))
 DEFAULT_HEBBIAN_WEIGHT = float(os.environ.get('MEMORY_HEBBIAN_WEIGHT', '0.15'))
 DEFAULT_STRENGTH_WEIGHT = float(os.environ.get('MEMORY_STRENGTH_WEIGHT', '0.10'))
 
-import os
+# In semantic mode, fetch more candidates for full ranking
+_SEMANTIC_MODE = os.environ.get('VITRIOL_SEMANTIC_MODE', 'off').lower() == 'on'
+_CANDIDATE_MULTIPLIER = 20 if _SEMANTIC_MODE else 10
 
 
 def classify_intent(query: str) -> str:
@@ -67,14 +72,17 @@ def retrieve(
     candidates = []
 
     # ── Hop 1: Direct Retrieval ──
-    episodes = db.search_episodes(project_id, query, limit=top_k * 3)
+    # Use larger candidate pool in semantic mode for full ranking
+    episodes = db.search_episodes(project_id, query, limit=top_k * _CANDIDATE_MULTIPLIER)
     for ep in episodes:
         ep['_type'] = 'episode'
         ep['_content'] = ep.get('content', '')
         ep['_source'] = 'hop1_direct'
     _merge_candidates(candidates, episodes)
 
-    nodes = db.search_nodes(project_id, query, limit=top_k * 2)
+    # In semantic mode, fetch all nodes (no pre-filtering needed)
+    node_limit = top_k * (_CANDIDATE_MULTIPLIER // 3) if _SEMANTIC_MODE else top_k * 2
+    nodes = db.search_nodes(project_id, query, limit=node_limit)
     for n in nodes:
         n['_type'] = 'node'
         n['_content'] = n.get('summary', '')

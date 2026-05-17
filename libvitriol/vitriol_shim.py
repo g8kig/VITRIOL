@@ -71,6 +71,11 @@ FROZEN_PROMPT = os.environ.get('VITRIOL_FROZEN_PROMPT', 'off').lower() == 'on'
 # Track the last frozen prefix hash to detect changes
 _last_frozen_hash: Optional[int] = None
 
+# Semantic search mode
+SEMANTIC_MODE = os.environ.get('VITRIOL_SEMANTIC_MODE', 'off').lower() == 'on'
+if SEMANTIC_MODE:
+    logger.info("Semantic search enabled (VITRIOL_SEMANTIC_MODE=on)")
+
 
 @dataclass
 class RectificationStats:
@@ -608,6 +613,7 @@ def health():
         "status": "ok",
         "shim": "running",
         "memory_mode": MEMORY_MODE,
+        "semantic_mode": SEMANTIC_MODE,
         "backend": bstatus,
         "config": {
             "max_context_tokens": MAX_CONTEXT_TOKENS,
@@ -615,6 +621,7 @@ def health():
             "llama_api_url": LLAMA_API_URL,
             "context_strategy": CONTEXT_STRATEGY,
             "memory_mode": "on" if MEMORY_MODE else "off",
+            "semantic_mode": "on" if SEMANTIC_MODE else "off",
         }
     })
 
