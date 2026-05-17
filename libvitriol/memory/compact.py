@@ -5,6 +5,7 @@ Converts retrieved candidate memories into a compact, formatted system message
 that fits within a strict token budget.
 """
 
+import os
 from typing import Optional
 from datetime import datetime
 

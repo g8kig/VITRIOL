@@ -41,7 +41,11 @@ except ImportError:
 MEMORY_MODE = os.environ.get('VITRIOL_MEMORY_MODE', 'off').lower() == 'on'
 if MEMORY_MODE:
     try:
-        from . import memory as emem
+        import sys, os
+        _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _parent not in sys.path:
+            sys.path.insert(0, _parent)
+        from libvitriol import memory as emem
         logger.info("Emulated memory subsystem loaded (VITRIOL_MEMORY_MODE=on)")
     except ImportError as e:
         MEMORY_MODE = False
@@ -93,12 +97,12 @@ def get_gpu_temp() -> int:
     """
     try:
         result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader,nounits'],
+            ['nvidia-smi', '--id=0', '--query-gpu=temperature.gpu', '--format=csv,noheader,nounits'],
             capture_output=True,
             text=True,
             timeout=1
         )
-        return int(result.stdout.strip())
+        return int(result.stdout.strip().split('\n')[0])
     except Exception as e:
         logger.warning(f"Thermal poll failed: {e}")
         return 0
@@ -648,49 +652,6 @@ def rectify_only():
                 "reduction_percent": stats.reduction_percent
             },
             "rectified_messages": rectified
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/context/archive', methods=['POST'])
-def archive_context_endpoint():
-    """
-    Manually archive context to SSD.
-    Useful for long conversations where you want to preserve history.
-    """
-    try:
-        data = request.json
-        messages = data.get('messages', [])
-        archive_path = data.get('path', '/tmp/vitriol_context_archive.json')
-        
-        result_path = archive_context_to_ssd(messages, archive_path)
-        if result_path:
-            return jsonify({
-                "status": "ok",
-                "archive_path": result_path,
-                "messages_archived": len(messages)
-            })
-        else:
-            return jsonify({"error": "Archival failed"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/context/retrieve', methods=['GET'])
-def retrieve_context_endpoint():
-    """
-    Retrieve archived context from SSD.
-    Returns messages list for potential injection into conversation.
-    """
-    try:
-        archive_path = request.args.get('path', '/tmp/vitriol_context_archive.json')
-        messages = retrieve_context_from_ssd(archive_path)
-        
-        return jsonify({
-            "status": "ok",
-            "messages": messages,
-            "message_count": len(messages)
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500

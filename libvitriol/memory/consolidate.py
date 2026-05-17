@@ -5,6 +5,7 @@ Background thread that summarizes batches of raw episodes into dense
 knowledge nodes, mimicking human sleep consolidation.
 """
 
+import os
 import threading
 import time
 import logging
