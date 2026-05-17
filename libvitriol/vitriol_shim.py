@@ -145,6 +145,9 @@ def retrieve_context_from_ssd(archive_path: str = "/tmp/vitriol_context_archive.
     Context Offloading Strategy 2: Retrieve archived context from SSD
     Returns messages list or empty list on error
     """
+    if not os.path.exists(archive_path):
+        logger.info("No archived context yet (first request or archive empty)")
+        return []
     try:
         with open(archive_path, 'r') as f:
             data = json.load(f)
@@ -609,6 +612,11 @@ def proxy_chat_completions():
         
         # === GUARDRAIL 3: Coagulation (Generation Cap) ===
         data['max_tokens'] = min(data.get('max_tokens', 1024), 1024)
+
+        # Strip streaming — the shim doesn't proxy SSE yet.
+        # TODO: proxy SSE chunks through for lower first-token latency.
+        # For now, buffer the full response and return JSON.
+        data.pop('stream', None)
         
         # Check backend status
         bstatus = backend_status()
