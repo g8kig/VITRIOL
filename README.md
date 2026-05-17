@@ -372,7 +372,35 @@ VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe,
 | Project | What We Learned |
 |---------|-----------------|
 | **[KTransformers](https://github.com/kvcache-ai/KTransformers)** (kvcache-ai) | YAML-based layer placement across CPU/GPU, double-buffer prefetch pattern (compute layer N while streaming N+1), MoE-specific async scheduling. KTransformers targets modern CPUs (AMX/AVX512); VITRIOL inverts this — GPU as primary compute, CPU as orchestrator only. |
+| **[PowerInfer](https://github.com/SJTU-IPADS/PowerInfer)** (SJTU-IPADS) | Neuron-level offloading with predictor for which neurons will fire — only loads those into GPU. Informs our predictive prefetching approach. |
 | **Qwen3.6-35B-A3B MoE** | 256 experts, 8 active per token — the exact sparsity architecture that makes expert streaming viable. The MoE router (`ffn_gate_inp`) determines which 8 experts to load; only those need to be in VRAM. |
+
+### Speculative Decoding
+
+| Paper / Project | What We Learned |
+|-----------------|-----------------|
+| **[Speculative Sampling](https://arxiv.org/abs/2211.17192)** — Leviathan et al. (Google, 2022) | Proved that verification of token sequences is parallelizable — checking 5 tokens takes the same time as checking 1. Foundation of all speculative decoding. |
+| **[Speculative Sampling](https://arxiv.org/abs/2302.01318)** — Chen et al. (DeepMind, 2023) | Established rejection sampling math ensuring fast/slow model pair output is identical to the slow model alone. |
+| **[Medusa](https://github.com/FasterDecoding/Medusa)** — Cai et al. (2024) | Multiple lightweight decoding heads on a single model to predict +1, +2, +3 tokens ahead. No second model needed. |
+| **[EAGLE](https://github.com/SafeAILab/EAGLE)** — Li et al. (2024) | Predicts feature vectors (hidden states) instead of tokens — current SOTA for self-speculative decoding. |
+| **[Self-Speculative Decoding](https://arxiv.org/abs/2307.13304)** — (2023) | Layer skipping: run a subset of layers for draft generation, full model for verification. Highly relevant for VITRIOL's DMA layer — skip PCIe transfer for 80% of MoE layers during draft phase. |
+| **[Mixture of Speculative Experts](https://arxiv.org/abs/2402.13524)** — (2024) | Top-1 expert draft for MoE: generate guesses using 1/8 experts, verify with all 8. Directly applicable to VITRIOL's expert routing. |
+| **[Prompt Lookup Decoding](https://github.com/apoorvumang/prompt-lookup-decoding)** — Umang (2024) | N-gram matching from existing context — if a token sequence appeared before, reuse it as a draft. Zero extra VRAM, "free" speed on code tasks. |
+
+### KV Cache & Context Management
+
+| Paper / Project | What We Learned |
+|-----------------|-----------------|
+| **[vLLM PagedAttention](https://arxiv.org/abs/2309.06180)** — Kwon et al. (2023) | Block-level KV cache management enabling near-zero memory waste. Foundation of efficient serving. |
+| **[KIVI](https://arxiv.org/abs/2402.02750)** — Liu et al. (2024) | 2-bit KV cache quantization with minimal accuracy loss. Informs `--kv-quant q4_0` and future KV compression. |
+| **[StreamingLLM](https://arxiv.org/abs/2309.17453)** — Xiao et al. (2023) | Identified "attention sinks" (first few tokens) that must be preserved for stable long-context generation. Core insight behind sparse KV caching. |
+
+### CPU Offload & Ternary Compute
+
+| Paper / Project | What We Learned |
+|-----------------|-----------------|
+| **[Fiddler](https://arxiv.org/abs/2402.14103)** — Kamahori, Gu, Zhu, Kasikci (2024) | Demonstrated that moving *activations* to CPU for MoE expert computation can be faster than pulling weights to GPU via PCIe DMA. Informs future `--engine-mode fiddler-cpu`. |
+| **[T-MAC](https://github.com/microsoft/T-MAC)** (Microsoft, 2024) | Lookup-table-based CPU inference for low-bit models. Accelerates ternary math on CPUs without AVX-512. |
 
 ### Extreme Quantization & Compute
 
