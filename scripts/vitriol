@@ -763,6 +763,7 @@ case "$CMD" in
         CLI_KV_QUANT=""
         CLI_LOOKUP=""
         CLI_ENGINE_MODE=""
+        CLI_DISK_OFFLOAD=""
         DRY_RUN=false
 
         while [[ $# -gt 0 ]]; do
@@ -781,6 +782,7 @@ case "$CMD" in
                 --lookup) CLI_LOOKUP="$2"; shift 2 ;;
                 --engine-mode) CLI_ENGINE_MODE="$2"; shift 2 ;;
                 --verbose) CLI_VERBOSE="true"; shift ;;
+                --disk-offload) CLI_DISK_OFFLOAD="1"; shift ;;
                 --dry-run) DRY_RUN=true; shift ;;
                 -h|--help) usage; exit 0 ;;
                 *) echo "Unknown: $1"; usage; exit 1 ;;
@@ -802,6 +804,7 @@ case "$CMD" in
         KV_QUANT="${CLI_KV_QUANT:-${CFG_KV_QUANT}}"
         LOOKUP="${CLI_LOOKUP:-${CFG_LOOKUP}}"
         ENGINE_MODE="${CLI_ENGINE_MODE:-${CLI_ENGINE_MODE:-${CFG_ENGINE_MODE}}}"
+        DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -883,7 +886,9 @@ case "$CMD" in
             VITRIOL_KV_QUANT="$KV_QUANT" \
             VITRIOL_LOOKUP="$LOOKUP" \
             VITRIOL_ENGINE_MODE="$ENGINE_MODE" \
-            LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
+            VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
+            VITRIOL_MODEL_PATH="$MODEL" \
+                    LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
             $ENV_VERBOSE \
             "$BINARY" \
             -m "$MODEL" \
@@ -912,6 +917,7 @@ case "$CMD" in
         CLI_KV_QUANT=""
         CLI_LOOKUP=""
         CLI_ENGINE_MODE=""
+        CLI_DISK_OFFLOAD=""
         DETACH=false
         DRY_RUN=false
 
@@ -932,6 +938,7 @@ case "$CMD" in
                 --kv-quant) CLI_KV_QUANT="$2"; shift 2 ;;
                 --lookup) CLI_LOOKUP="$2"; shift 2 ;;
                 --engine-mode) CLI_ENGINE_MODE="$2"; shift 2 ;;
+                --disk-offload) CLI_DISK_OFFLOAD="1"; shift ;;
                 --detach) DETACH=true; shift ;;
                 --verbose) CLI_VERBOSE="true"; shift ;;
                 --dry-run) DRY_RUN=true; shift ;;
@@ -956,6 +963,7 @@ case "$CMD" in
         KV_QUANT="${CLI_KV_QUANT:-${CFG_KV_QUANT}}"
         LOOKUP="${CLI_LOOKUP:-${CFG_LOOKUP}}"
         ENGINE_MODE="${CLI_ENGINE_MODE:-${CLI_ENGINE_MODE:-${CFG_ENGINE_MODE}}}"
+        DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -1047,6 +1055,8 @@ case "$CMD" in
                     VITRIOL_KV_QUANT="$KV_QUANT" \
                     VITRIOL_LOOKUP="$LOOKUP" \
                     VITRIOL_ENGINE_MODE="$ENGINE_MODE" \
+                    VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
+                    VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
                     nohup "$SERVER_BINARY" \
@@ -1091,6 +1101,8 @@ case "$CMD" in
                     VITRIOL_KV_QUANT="$KV_QUANT" \
                     VITRIOL_LOOKUP="$LOOKUP" \
                     VITRIOL_ENGINE_MODE="$ENGINE_MODE" \
+                    VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
+                    VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
                     nohup "$SERVER_BINARY" \
@@ -1135,6 +1147,8 @@ case "$CMD" in
                     VITRIOL_KV_QUANT="$KV_QUANT" \
                     VITRIOL_LOOKUP="$LOOKUP" \
                     VITRIOL_ENGINE_MODE="$ENGINE_MODE" \
+                    VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
+                    VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
                     "$SERVER_BINARY" \
@@ -1177,6 +1191,8 @@ case "$CMD" in
                     VITRIOL_KV_QUANT="$KV_QUANT" \
                     VITRIOL_LOOKUP="$LOOKUP" \
                     VITRIOL_ENGINE_MODE="$ENGINE_MODE" \
+                    VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
+                    VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
                     "$SERVER_BINARY" \
