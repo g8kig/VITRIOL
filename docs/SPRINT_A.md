@@ -44,7 +44,7 @@ vitriol serve --detach -m /path/to/TQ1_0.gguf --engine-mode native --kv-quant q4
 |------|--------|-------|
 | 1 (TQ1_0 model load) | ✅ | Binary loads and recognizes TQ1_0 GGUF (`file type = TQ1_0 - 1.69 bpw ternary`) |
 | 2 (parallel = 1) | ✅ | LRU thrash stopped (indirect — tok/s stable at 5.9) |
-| 3A (TQ1_0 native CUDA) | ❌ | Segfault in libllama.so during tensor loading with `--no-mmap` + VITRIOL buffer or `--cpu-moe`. Works with `mmap` (no VITRIOL) but 1.77 tok/s (no CUDA TQ kernels) |
+| 3A (TQ1_0 native CUDA) | ❌ | TQ2_0 CUDA kernels require deeper structural merge (template param mismatch, brace imbalance). Build restored to clean VITRIOL base. TQ integration deferred to a future sprint where we fork cleanly from turbo-tan. |
 | 3B (Q2_K_XL + Q4_0 KV) | ✅ | KV cache 135 MiB (was 480 MiB). 5.9 tok/s gen, 118 tok/s eval. **The real win.** |
 | 4 (shim bugs) | ⏳ | Deferred — not needed if running without shim |
 | 5 (OpenCode direct) | ⏳ | Pending user test |
