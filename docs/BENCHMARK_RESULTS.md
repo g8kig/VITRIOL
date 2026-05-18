@@ -50,13 +50,36 @@
 | 50     | 5.70       | 45.13       | 377         |
 | 100    | 5.62       | 45.12       | 377         |
 
+### Frozen Prompt Enabled (500k ctx, LRU=2048 MB) — BEST CONFIG
+| Config | Length | Gen (tok/s) | Eval (tok/s) | Prefill (ms) |
+|--------|--------|------------|-------------|-------------|
+| Frozen, LRU=1024, t=4 | 50 | **5.79** | **64.84** | 416 |
+| Frozen, LRU=1024, t=4 | 100 | **5.72** | **62.76** | 430 |
+| Frozen, LRU=2048, t=4 | 50 | **5.89** | **58.57** | 461 |
+| Frozen, LRU=2048, t=4 | 100 | **5.87** | **66.29** | 407 |
+| Frozen, LRU=4096, t=4 | 50 | 5.78 | 61.69 | 438 |
+| Frozen, LRU=4096, t=4 | 100 | 5.71 | 65.21 | 414 |
+
+### Thread Tuning
+| Config | Gen (tok/s) | Notes |
+|--------|------------|-------|
+| t=4 (baseline) | 5.63-5.70 | **Best** |
+| t=8 | 4.14-4.21 | 25% worse — thread contention |
+
 ### VRAM Usage
 - Model weights (GPU): 1337 MiB
 - VITRIOL buffer (RAM): 10040 MiB
-- KV cache (254k Q4_0): 1396 MiB (on GPU)
+- KV cache (500k Q4_0): ~2800 MiB (on GPU, estimated)
 - Compute/RS buffers: ~556 MiB
-- Total VRAM used: ~3738 MiB (before LRU allocation)
-- Headroom: ~4374 MiB
+- Total VRAM used: ~3921 MiB (measured at 254k)
+- Headroom: ~4191 MiB
+
+## Conclusions
+1. **Frozen prompt provides the biggest gain** — eval speed +50% (43→65 tok/s), gen +3% (5.63→5.79)
+2. LRU 2048 slightly better than 1024 with frozen prompt (5.87 vs 5.72)
+3. More threads (t=8) makes things **worse** — contention overhead
+4. Q4_0 KV cache enables massive context (500k+ fits in ~4 GB VRAM)
+5. VITRIOL stream mode is required for 35B MoE on 8 GB VRAM
 
 ## Conclusions
 1. LRU size (512-4096 MB) does not significantly affect generation speed — bottleneck is GPU compute

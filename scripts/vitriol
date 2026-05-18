@@ -101,9 +101,9 @@ parse_config() {
                 memory.mode)           CFG_MEMORY_MODE="$val" ;;
                 memory.semantic_mode)  CFG_SEMANTIC_MODE="$val" ;;
                 kv.mode)               CFG_KV_MODE="$val" ;;
-                frozen_prompt)         CFG_FROZEN_PROMPT="$val" ;;
+                kv.frozen_prompt)      CFG_FROZEN_PROMPT="$val" ;;
                 kv.quant_mode)         CFG_KV_QUANT="$val" ;;
-                lookup_tokens)           CFG_LOOKUP="$val" ;;
+                lookup_tokens)         CFG_LOOKUP="$val" ;;
                 engine.mode)             CFG_ENGINE_MODE="$val" ;;
             esac
         fi
@@ -396,11 +396,11 @@ tui_model_menu() {
                 fi
                 ;;
             2)
-                read -r -p "Enter context window (512-32768): " val
-                if [[ "$val" =~ ^[0-9]+$ ]] && ((val >= 512 && val <= 262144)); then
+                read -r -p "Enter context window (512-1000000): " val
+                if [[ "$val" =~ ^[0-9]+$ ]] && ((val >= 512 && val <= 1000000)); then
                     config_set model.context "$val"
                 else
-                    echo "Invalid (must be 512-262144)"; sleep 1
+                    echo "Invalid (must be 512-1000000)"; sleep 1
                 fi
                 ;;
             3)
