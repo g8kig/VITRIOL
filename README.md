@@ -44,6 +44,8 @@ VITRIOL has several feature flags that control memory, context efficiency, and r
 
 All flags can be set via CLI flag, env var, or the TUI (`vitriol config`).
 
+**Configuration defaults guide:** [`docs/CONFIG_DEFAULTS_GUIDE.md`](docs/CONFIG_DEFAULTS_GUIDE.md) — why each default was chosen, measured performance impact, and when to diverge.
+
 **Full reference:** [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) — every flag explained with trade-offs, use cases, and recommended combinations.
 
 **OpenCode setup:** [`docs/OPENCODE_SETUP.md`](docs/OPENCODE_SETUP.md) — configuring VITRIOL as an OpenCode provider, why `vitriol setup` is required, workflow recommendations.
