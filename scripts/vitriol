@@ -296,12 +296,12 @@ tui_main_menu() {
         printf "║  %-37s ║\n" "4) Memory Settings"
         printf "║  %-37s ║\n" "5) Engine Settings"
         printf "║  %-37s ║\n" "6) Server Settings"
-        printf "║  %-37s ║\n" "6) Show Current Config"
-        printf "║  %-37s ║\n" "7) Reset to Defaults"
+        printf "║  %-37s ║\n" "7) Show Current Config"
+        printf "║  %-37s ║\n" "8) Reset to Defaults"
         printf "║  %-37s ║\n" "q) Quit"
         echo "╚══════════════════════════════════════════╝"
         echo ""
-        read -r -p "Select [1-8/q]: " choice
+        read -r -p "Select [1-9/q]: " choice
         case "$choice" in
             1) tui_gpu_menu ;;
             2) tui_model_menu ;;
@@ -309,8 +309,8 @@ tui_main_menu() {
             4) tui_memory_menu ;;
             5) tui_engine_menu ;;
             6) tui_server_menu ;;
-            6) clear; print_header; config_show; echo ""; read -r -p "Press Enter to continue..." ;;
-            7) config_reset; echo ""; read -r -p "Press Enter to continue..." ;;
+            7) clear; print_header; config_show; echo ""; read -r -p "Press Enter to continue..." ;;
+            8) config_reset; echo ""; read -r -p "Press Enter to continue..." ;;
             q|Q) clear; exit 0 ;;
             *) ;;
         esac
