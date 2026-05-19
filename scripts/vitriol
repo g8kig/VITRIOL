@@ -39,6 +39,8 @@ DEFAULT_SEMANTIC_MODE="off"
 DEFAULT_KV_QUANT="f16"
 DEFAULT_LOOKUP=0
 DEFAULT_ENGINE_MODE="vitriol-dma"
+DEFAULT_SPEC_TYPE=""
+DEFAULT_SPEC_DRAFT_N_MAX=0
 
 # ── config vars (set by parse_config) ────────────────────────────
 CFG_DEVICE="$DEFAULT_DEVICE"
@@ -60,6 +62,8 @@ CFG_SEMANTIC_MODE="$DEFAULT_SEMANTIC_MODE"
 CFG_KV_QUANT="$DEFAULT_KV_QUANT"
 CFG_LOOKUP="$DEFAULT_LOOKUP"
 CFG_ENGINE_MODE="$DEFAULT_ENGINE_MODE"
+CFG_SPEC_TYPE="$DEFAULT_SPEC_TYPE"
+CFG_SPEC_DRAFT_N_MAX="$DEFAULT_SPEC_DRAFT_N_MAX"
 
 # ═════════════════════════════════════════════════════════════════
 # CONFIG PARSING
@@ -105,6 +109,8 @@ parse_config() {
                 kv.quant_mode)         CFG_KV_QUANT="$val" ;;
                 lookup_tokens)         CFG_LOOKUP="$val" ;;
                 engine.mode)             CFG_ENGINE_MODE="$val" ;;
+                spec.type)             CFG_SPEC_TYPE="$val" ;;
+                spec.draft_n_max)      CFG_SPEC_DRAFT_N_MAX="$val" ;;
             esac
         fi
     done < "$CONFIG_FILE"
@@ -169,6 +175,12 @@ mode = $CFG_ENGINE_MODE
 [lookup]
 # Prompt lookup decoding tokens (0 = disabled)
 tokens = $CFG_LOOKUP
+
+[spec]
+# Speculative decoding type: mtp | draft (leave empty to disable)
+type = $CFG_SPEC_TYPE
+# Draft tokens to generate for speculative decoding (e.g. 2 for MTP)
+draft_n_max = $CFG_SPEC_DRAFT_N_MAX
 CFGEOF
 }
 
@@ -212,6 +224,8 @@ config_show() {
     print_row "Frozen Prompt:         " "${CFG_FROZEN_PROMPT}"
     print_row "KV Quant:              " "${CFG_KV_QUANT}"
     print_row "Prompt Lookup:         " "${CFG_LOOKUP}"
+    [[ -n "$CFG_SPEC_TYPE" ]] && print_row "Spec Type:             " "${CFG_SPEC_TYPE}"
+    [[ "${CFG_SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && print_row "Spec Draft N-Max:      " "${CFG_SPEC_DRAFT_N_MAX}"
     echo "╠$(printf '─%.0s' $(seq 1 $box_w))╣"
     print_row "Engine Mode:           " "${CFG_ENGINE_MODE}"
     echo "╠$(printf '─%.0s' $(seq 1 $box_w))╣"
@@ -259,6 +273,8 @@ config_set() {
         kv.quant_mode)         CFG_KV_QUANT="$val" ;;
         lookup_tokens)          CFG_LOOKUP="$val" ;;
         engine.mode)           CFG_ENGINE_MODE="$val" ;;
+        spec.type)             CFG_SPEC_TYPE="$val" ;;
+        spec.draft_n_max)      CFG_SPEC_DRAFT_N_MAX="$val" ;;
         frozen_prompt)         CFG_FROZEN_PROMPT="$val" ;;
         *) echo "Unknown key: $key"; return 1 ;;
     esac
@@ -729,6 +745,8 @@ Serve options:
   --frozen-prompt M    frozen prompt caching: on | off
   --semantic-mode M    semantic search: on | off (requires sentence-transformers)
   --detach             run server in background
+  --spec-type TYPE     speculative decoding type (mtp, draft, etc.)
+  --spec-draft-n-max N number of tokens to draft (e.g. 2 for MTP)
   --verbose          enable debug logging
   --dry-run          print config without launching
 
@@ -764,6 +782,8 @@ case "$CMD" in
         CLI_LOOKUP=""
         CLI_ENGINE_MODE=""
         CLI_DISK_OFFLOAD=""
+        CLI_SPEC_TYPE=""
+        CLI_SPEC_DRAFT_N_MAX=""
         DRY_RUN=false
 
         while [[ $# -gt 0 ]]; do
@@ -781,6 +801,8 @@ case "$CMD" in
                 --kv-quant) CLI_KV_QUANT="$2"; shift 2 ;;
                 --lookup) CLI_LOOKUP="$2"; shift 2 ;;
                 --engine-mode) CLI_ENGINE_MODE="$2"; shift 2 ;;
+                --spec-type) CLI_SPEC_TYPE="$2"; shift 2 ;;
+                --spec-draft-n-max) CLI_SPEC_DRAFT_N_MAX="$2"; shift 2 ;;
                 --verbose) CLI_VERBOSE="true"; shift ;;
                 --disk-offload) CLI_DISK_OFFLOAD="1"; shift ;;
                 --dry-run) DRY_RUN=true; shift ;;
@@ -805,6 +827,8 @@ case "$CMD" in
         LOOKUP="${CLI_LOOKUP:-${CFG_LOOKUP}}"
         ENGINE_MODE="${CLI_ENGINE_MODE:-${CLI_ENGINE_MODE:-${CFG_ENGINE_MODE}}}"
         DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
+        SPEC_TYPE="${CLI_SPEC_TYPE:-${CFG_SPEC_TYPE}}"
+        SPEC_DRAFT_N_MAX="${CLI_SPEC_DRAFT_N_MAX:-${CFG_SPEC_DRAFT_N_MAX}}"
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -918,6 +942,8 @@ case "$CMD" in
         CLI_LOOKUP=""
         CLI_ENGINE_MODE=""
         CLI_DISK_OFFLOAD=""
+        CLI_SPEC_TYPE=""
+        CLI_SPEC_DRAFT_N_MAX=""
         DETACH=false
         DRY_RUN=false
 
@@ -938,6 +964,8 @@ case "$CMD" in
                 --kv-quant) CLI_KV_QUANT="$2"; shift 2 ;;
                 --lookup) CLI_LOOKUP="$2"; shift 2 ;;
                 --engine-mode) CLI_ENGINE_MODE="$2"; shift 2 ;;
+                --spec-type) CLI_SPEC_TYPE="$2"; shift 2 ;;
+                --spec-draft-n-max) CLI_SPEC_DRAFT_N_MAX="$2"; shift 2 ;;
                 --disk-offload) CLI_DISK_OFFLOAD="1"; shift ;;
                 --detach) DETACH=true; shift ;;
                 --verbose) CLI_VERBOSE="true"; shift ;;
@@ -964,6 +992,8 @@ case "$CMD" in
         LOOKUP="${CLI_LOOKUP:-${CFG_LOOKUP}}"
         ENGINE_MODE="${CLI_ENGINE_MODE:-${CLI_ENGINE_MODE:-${CFG_ENGINE_MODE}}}"
         DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
+        SPEC_TYPE="${CLI_SPEC_TYPE:-${CFG_SPEC_TYPE}}"
+        SPEC_DRAFT_N_MAX="${CLI_SPEC_DRAFT_N_MAX:-${CFG_SPEC_DRAFT_N_MAX}}"
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -1011,6 +1041,8 @@ case "$CMD" in
         echo "  KV Quant:    $KV_QUANT"
         echo "  Lookup:      $LOOKUP"
         echo "  Engine:      $ENGINE_MODE"
+        [[ -n "$SPEC_TYPE" ]] && echo "  Spec Type:   $SPEC_TYPE"
+        [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && echo "  Draft N-Max: $SPEC_DRAFT_N_MAX"
         if [[ "$MEMORY_MODE" == "on" ]]; then
             LLAMA_PORT=$((PORT - 1))
             echo "  Server:      http://${HOST}:${LLAMA_PORT} (llama-server, internal)"
@@ -1033,6 +1065,10 @@ case "$CMD" in
         # KV cache quant args (pass to llama-server as --cache-type-k/v)
         KV_CACHE_ARGS=""
         [[ "$KV_QUANT" != "f16" ]] && KV_CACHE_ARGS="--cache-type-k $KV_QUANT --cache-type-v $KV_QUANT"
+        # Speculative decoding args
+        SPEC_ARGS=""
+        [[ -n "$SPEC_TYPE" ]] && SPEC_ARGS="--spec-type $SPEC_TYPE"
+        [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && SPEC_ARGS="$SPEC_ARGS --spec-draft-n-max $SPEC_DRAFT_N_MAX"
         # Flash Attention is required for V cache quantization and generally faster
         FA_ARGS="-fa on"
 
@@ -1067,8 +1103,8 @@ case "$CMD" in
                         --port "$LLAMA_PORT" \
                         --parallel "$PARALLEL" \
                         --no-mmap \
-                        -t "$THREADS" \
-                            $KV_CACHE_ARGS $FA_ARGS \
+                         -t "$THREADS" \
+                            $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS \
                             "$@" &>"${CONFIG_DIR}/llama-server.log" &
                 echo $! > "${CONFIG_DIR}/llama-server.pid"
                 echo "  llama-server PID: $! (internal port $LLAMA_PORT)"
@@ -1114,7 +1150,7 @@ case "$CMD" in
                         --parallel "$PARALLEL" \
                         --no-mmap \
                         -t "$THREADS" \
-                        $KV_CACHE_ARGS $FA_ARGS \
+                        $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS \
                         "$@" &>"${CONFIG_DIR}/server.log" &
                 echo $! > "${CONFIG_DIR}/server.pid"
                 echo "  Server PID: $!"
@@ -1204,7 +1240,7 @@ case "$CMD" in
                     --parallel "$PARALLEL" \
                     --no-mmap \
                     -t "$THREADS" \
-                    $KV_CACHE_ARGS $FA_ARGS \
+                    $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS \
                     "$@"
             fi
         fi

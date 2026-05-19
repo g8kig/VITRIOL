@@ -22,6 +22,20 @@
 | 50     | 9.10       | 58.2        | Sustained |
 | 100    | 8.91       | 58.3        | Sustained |
 
+### 256k Context — MTP Enabled (IQ2_M model, --spec-type mtp --spec-draft-n-max 2)
+| Length | Gen (tok/s) | Eval (tok/s) | Draft N | Accepted | Accept Rate |
+|--------|------------|-------------|---------|----------|-------------|
+| 10     | 11.40      | 58.3        | 8       | 4        | 50% |
+| 50     | 10.51      | 58.0        | 48      | 24       | 50% |
+| 100    | 10.35      | 57.7        | 98      | 49       | 50% |
+
+**MTP improvement over non-MTP: +15-16% gen speed**
+> MTP speculative decoding with `draft-n-max=2` yields 50% acceptance rate
+> (1 of 2 drafted tokens accepted per cycle). VITRIOL expert offloading
+> handles both main trunk and MTP head seamlessly via the same buffer.
+>
+> Model: Qwen3.6-35B-A3B-UD-IQ2_M.gguf (IQ2_M quant, 2.6 bpw)
+
 **Improvement vs prior baseline (~5.7 tok/s gen): +56-60%**
 > Root cause: PCIe Gen3 bottleneck. GTX 960 in second slot halved primary slot to x8 (7.88 GB/s).
 > Removing it restored x16 (15.76 GB/s), nearly doubling expert transfer bandwidth.
