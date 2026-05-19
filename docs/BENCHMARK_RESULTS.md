@@ -1,21 +1,42 @@
 # VITRIOL Benchmark Results
 
 ## Hardware
-- GPU: NVIDIA GeForce GTX 1070 Ti (8112 MiB VRAM)
+- GPU: NVIDIA GeForce GTX 1070 Ti (8112 MiB VRAM, PCIe Gen3 x16)
 - RAM: 15 GB
 - CPU: 4 threads
+- **2026-05-19: GTX 960 removed — PCIe restored from x8 to x16**
 
 ## Model
 - Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf (12 GB)
 - Architecture: qwen35moe, 40 layers, 256 experts (8 active/token)
 - VITRIOL mode: stream (page-locked RAM + LRU VRAM cache)
+- Frozen prompt: on (permanent after diagnosis)
+- KV cache: Q4_0
 
-## KV Cache
-- Quantization: Q4_0 (4-bit)
-- Per token: ~20 KB (40 layers × 2 KV heads × 256 dim × 0.5 bytes)
-- VRAM cost: ~2.5 GB at 128K, ~5.1 GB at 256K (measured: 1396 MiB at 254K — lower than estimate due to efficient format)
+## Generation Speed Tests — CURRENT (PCIe x16, GTX 960 removed)
 
-## Generation Speed Tests
+### 256k Context — Best Config (Frozen Prompt, Q4_0 KV)
+| Length | Gen (tok/s) | Eval (tok/s) | Notes |
+|--------|------------|-------------|-------|
+| 10     | 9.80       | 57.0        | Short burst peak |
+| 50     | 9.10       | 58.2        | Sustained |
+| 100    | 8.91       | 58.3        | Sustained |
+
+**Improvement vs prior baseline (~5.7 tok/s gen): +56-60%**
+> Root cause: PCIe Gen3 bottleneck. GTX 960 in second slot halved primary slot to x8 (7.88 GB/s).
+> Removing it restored x16 (15.76 GB/s), nearly doubling expert transfer bandwidth.
+
+### VRAM Usage
+- Model weights (GPU): 1337 MiB
+- VITRIOL buffer (RAM): 10040 MiB
+- KV cache (256k Q4_0): ~1406 MiB (host context allocation)
+- Compute/RS buffers: ~556 MiB
+- Total VRAM at 256K: ~3921 MiB
+- Headroom: ~4191 MiB
+
+---
+
+## Historical Results (GTX 960 present, PCIe x8, v1 configs)
 
 ### 100k Context, LRU=512 MB
 | Length | Gen (tok/s) | Eval (tok/s) | Prefill (ms) |
@@ -68,23 +89,10 @@
 | t=4 (baseline) | 5.63-5.70 | **Best** |
 | t=8 | 4.14-4.21 | 25% worse — thread contention |
 
-### VRAM Usage
-- Model weights (GPU): 1337 MiB
-- VITRIOL buffer (RAM): 10040 MiB
-- KV cache (500k Q4_0): ~2800 MiB (on GPU, estimated)
-- Compute/RS buffers: ~556 MiB
-- Total VRAM used: ~3921 MiB (measured at 254k)
-- Headroom: ~4191 MiB
-
 ## Conclusions
-1. **Frozen prompt provides the biggest gain** — eval speed +50% (43→65 tok/s), gen +3% (5.63→5.79)
-2. **LRU cache is unreachable** for quantized MoE models — all LRU settings gave identical VRAM and speed (see `docs/LRU_DIAGNOSTIC_FINDING.md`)
-3. More threads (t=8) makes things **worse** — contention overhead
-4. Q4_0 KV cache enables massive context (500k+ fits in ~4 GB VRAM)
-5. VITRIOL stream mode is required for 35B MoE on 8 GB VRAM
-
-## Conclusions
-1. LRU size (512-4096 MB) does not significantly affect generation speed — bottleneck is GPU compute
-2. Q4_0 KV cache enables large context (150k+ fits in ~3 GB)
-3. VITRIOL stream mode is required for 35B MoE on 8 GB VRAM (experts in RAM, cached on GPU)
-4. Token lookahead (prompt lookup decoding) not useful for general conversation
+1. **PCIe x16 is the dominant factor**: removing GTX 960 (which halved the slot to x8) yielded +60% gen speed, from 5.7→9.1 tok/s
+2. **Frozen prompt still important**: eval speed ~58-65 tok/s (vs ~45 without) — helps prefill, doesn't affect gen
+3. **LRU cache is unreachable** for quantized MoE models — all LRU settings gave identical VRAM and speed (see `docs/LRU_DIAGNOSTIC_FINDING.md`)
+4. More threads (t=8) makes things **worse** — contention overhead
+5. Q4_0 KV cache enables 256K context with ~1.4 GB host allocation
+6. VITRIOL stream mode is required for 35B MoE on 8 GB VRAM
