@@ -164,6 +164,8 @@ semantic_mode = $CFG_SEMANTIC_MODE
 [kv]
 # KV cache mode: standard | offload | sparse
 mode = $CFG_KV_MODE
+# KV cache quantization: f16 | q8_0 | q4_0
+quant_mode = $CFG_KV_QUANT
 
 # Frozen prompt: on | off (keep system prompt static to avoid re-prefix)
 frozen_prompt = $CFG_FROZEN_PROMPT
@@ -208,7 +210,9 @@ config_show() {
     print_row "GPU Device:            " "${CFG_DEVICE}"
     print_row "Exclude Secondary:     " "${CFG_EXCLUDE_SECONDARY}"
     echo "╠$(printf '─%.0s' $(seq 1 $box_w))╣"
-    print_row "Model:                 " "$(basename "${CFG_MODEL}" 2>/dev/null || echo "?")"
+    local mtp_label=""
+    model_has_mtp "$CFG_MODEL" && mtp_label=" [MTP]"
+    print_row "Model:                 " "$(basename "${CFG_MODEL}" 2>/dev/null || echo "?")${mtp_label}"
     print_row "Path:                  " "${CFG_MODEL}"
     print_row "Context:               " "${CFG_CTX}"
     print_row "Threads:               " "${CFG_THREADS}"
@@ -224,8 +228,12 @@ config_show() {
     print_row "Frozen Prompt:         " "${CFG_FROZEN_PROMPT}"
     print_row "KV Quant:              " "${CFG_KV_QUANT}"
     print_row "Prompt Lookup:         " "${CFG_LOOKUP}"
-    [[ -n "$CFG_SPEC_TYPE" ]] && print_row "Spec Type:             " "${CFG_SPEC_TYPE}"
-    [[ "${CFG_SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && print_row "Spec Draft N-Max:      " "${CFG_SPEC_DRAFT_N_MAX}"
+    if [[ -n "$CFG_SPEC_TYPE" ]]; then
+        local mtp_ok=""
+        model_has_mtp "$CFG_MODEL" && mtp_ok=" (MTP detected)"
+        print_row "Spec Type:             " "${CFG_SPEC_TYPE}${mtp_ok}"
+        [[ "${CFG_SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && print_row "Spec Draft N-Max:      " "${CFG_SPEC_DRAFT_N_MAX}"
+    fi
     echo "╠$(printf '─%.0s' $(seq 1 $box_w))╣"
     print_row "Engine Mode:           " "${CFG_ENGINE_MODE}"
     echo "╠$(printf '─%.0s' $(seq 1 $box_w))╣"
@@ -280,6 +288,18 @@ config_set() {
     esac
     write_config
     echo "✓ $key = $val"
+}
+
+# ═════════════════════════════════════════════════════════════════
+# MTP DETECTION
+# ═════════════════════════════════════════════════════════════════
+
+model_has_mtp() {
+    local model_path="$1"
+    if [[ ! -f "$model_path" ]]; then
+        return 1
+    fi
+    grep -q "nextn_predict_layers" < <(head -c 1M "$model_path") 2>/dev/null
 }
 
 # ═════════════════════════════════════════════════════════════════
@@ -388,20 +408,36 @@ tui_gpu_menu() {
 
 tui_model_menu() {
     while true; do
+        local mtp_indicator mtp_label
+        if model_has_mtp "$CFG_MODEL"; then
+            mtp_indicator="MTP ready"
+        else
+            mtp_indicator="no MTP"
+        fi
+        if [[ -n "$CFG_SPEC_TYPE" ]]; then
+            mtp_label="Spec Type [${CFG_SPEC_TYPE}]"
+        else
+            mtp_label="Spec Type [off]"
+        fi
         clear
         print_header
         echo "╔══════════════════════════════════════════╗"
         echo "║          Model Settings                  ║"
         echo "╠══════════════════════════════════════════╣"
         printf "║  %-37s ║\n" "1) Model Path       [$(basename "${CFG_MODEL}" 2>/dev/null || echo "?" )]"
+        printf "║  %-37s ║\n" "   (${mtp_indicator})"
         printf "║  %-37s ║\n" "2) Context Window   [${CFG_CTX}]"
         printf "║  %-37s ║\n" "3) Threads          [${CFG_THREADS}]"
         printf "║  %-37s ║\n" "4) GPU Layers (ngl) [${CFG_NGL}]"
+        printf "║  %-37s ║\n" "7) ${mtp_label}"
+        if [[ -n "$CFG_SPEC_TYPE" ]]; then
+            printf "║  %-37s ║\n" "8) Draft N-Max      [${CFG_SPEC_DRAFT_N_MAX:-0}]"
+        fi
         printf "║  %-37s ║\n" "b) Back to Main Menu"
         printf "║  %-37s ║\n" "q) Quit"
         echo "╚══════════════════════════════════════════╝"
         echo ""
-        read -r -p "Select [1-6/b/q]: " choice
+        read -r -p "Select [1-9/b/q]: " choice
         case "$choice" in
             1)
                 echo "Enter new model path (Tab completion available):"
@@ -450,6 +486,23 @@ tui_model_menu() {
                     config_set lookup_tokens "$val"
                 else
                     echo "Invalid (must be 0-128)"; sleep 1
+                fi
+                ;;
+            7)
+                echo "Speculative decoding type: mtp | draft (leave empty to disable)"
+                read -r -p "Enter type: " val
+                case "$val" in
+                    mtp|draft|"") config_set spec.type "$val" ;;
+                    *) echo "Invalid type (mtp, draft, or empty)"; sleep 1 ;;
+                esac
+                ;;
+            8)
+                echo "Number of tokens to draft per cycle (1-12, recommended: 2)"
+                read -r -p "Enter draft N: " val
+                if [[ "$val" =~ ^[0-9]+$ ]] && ((val >= 1 && val <= 12)); then
+                    config_set spec.draft_n_max "$val"
+                else
+                    echo "Invalid (must be 1-12)"; sleep 1
                 fi
                 ;;
             b|B) return ;;
@@ -869,8 +922,10 @@ case "$CMD" in
         clear
         [[ -f "$HEADER_FILE" ]] && cat "$HEADER_FILE"
         echo ""
+        local mtp_flag=""
+        model_has_mtp "$MODEL" && mtp_flag=" [MTP]"
         echo "═══ Launch Configuration ═══"
-        echo "  Model:       $(basename "$MODEL") ($MODEL_SIZE)"
+        echo "  Model:       $(basename "$MODEL") ($MODEL_SIZE)${mtp_flag}"
         echo "  Context:     $CTX tokens"
         echo "  Mode:        $MODE (RAM Shot + LRU cache)"
         [[ "$LRU_MB" -gt 0 ]] && echo "  LRU:         $LRU_MB MB VRAM cache"
@@ -882,6 +937,8 @@ case "$CMD" in
         echo "  KV Quant:    $KV_QUANT"
         echo "  Lookup:      $LOOKUP"
         echo "  Engine:      $ENGINE_MODE"
+        [[ -n "$SPEC_TYPE" ]] && echo "  Spec Type:   $SPEC_TYPE"
+        [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && echo "  Draft N-Max: $SPEC_DRAFT_N_MAX"
         echo "  Binary:      $BINARY"
         echo "  Port:        $PORT"
         [[ "$VERBOSE" == "true" ]] && echo "  Logging:     verbose"
@@ -1028,8 +1085,10 @@ case "$CMD" in
         clear
         [[ -f "$HEADER_FILE" ]] && cat "$HEADER_FILE"
         echo ""
+        local mtp_flag=""
+        model_has_mtp "$MODEL" && mtp_flag=" [MTP]"
         echo "═══ VITRIOL Server ═══"
-        echo "  Model:       $(basename "$MODEL") ($MODEL_SIZE)"
+        echo "  Model:       $(basename "$MODEL") ($MODEL_SIZE)${mtp_flag}"
         echo "  Context:     $CTX tokens"
         echo "  Mode:        $MODE (RAM Shot + LRU cache)"
         [[ "$LRU_MB" -gt 0 ]] && echo "  LRU:         $LRU_MB MB VRAM cache"
