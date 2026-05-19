@@ -35,18 +35,25 @@ VITRIOL has several feature flags that control memory, context efficiency, and r
 
 | Flag | Effect | tok/s impact | Use Case |
 |------|--------|-------------|----------|
-| `--memory-mode on` | Cross-session persistent memory via SQLite | 5.03 (vs 6.21 baseline) | Multi-session projects |
-| `--kv-mode offload` | KV cache in host RAM (20,000+ token context) | 5.80 | Long context coding |
-| `--kv-mode sparse` | Attention-score eviction (4-8x compression) | ~6.0 | Extreme context length |
-| `--frozen-prompt on` | Cache KV prefix across requests | ~6.2 (prefill saved) | Repeated requests, same system prompt |
+| `--spec-type mtp` / `--spec-draft-n-max 2` | MTP speculative decoding (+20% gen) | +20% | Max throughput (requires MTP-capable model) |
+| `--cache-type-k q4_0` / `--cache-type-v q4_0` | KV cache quantized to 4-bit | Required at 256K | Reduces host KV from 5000→1406 MiB; without it, RAM exceeds 15 GB |
+| `--kv-mode offload` | KV cache in host RAM | Enables 256K context | Long context coding |
+| `--kv-mode sparse` | Attention-score eviction (4-8x compression) | Saves host RAM | Extreme context length |
+| `--frozen-prompt on` | Cache KV prefix across requests | Prefill saved | Repeated requests, same system prompt |
+| `--memory-mode on` | Cross-session persistent memory via SQLite | ~5.0 | Multi-session projects |
 | `--semantic-mode on` | Cosine similarity retrieval | ~5.0 | Large memory databases |
-| `VITRIOL_PREDICTIVE_PREFETCH=1` | Expert prefetch via async DMA | +10-20% | Max throughput |
 
 All flags can be set via CLI flag, env var, or the TUI (`vitriol config`).
 
 **Configuration defaults guide:** [`docs/CONFIG_DEFAULTS_GUIDE.md`](docs/CONFIG_DEFAULTS_GUIDE.md) — why each default was chosen, measured performance impact, and when to diverge.
 
 **Full reference:** [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) — every flag explained with trade-offs, use cases, and recommended combinations.
+
+**Recommended settings:** [`docs/RECOMMENDED_SETTINGS.md`](docs/RECOMMENDED_SETTINGS.md) — exact optimal config for the GTX 1070 Ti system.
+
+**Optimization catalog:** [`docs/OPTIMIZATIONS_2026-05-19.md`](docs/OPTIMIZATIONS_2026-05-19.md) — prior art, viability analysis, and roadmap for further optimization.
+
+**Findings log:** [`docs/FINDINGS_2026-05-19.md`](docs/FINDINGS_2026-05-19.md) — detailed benchmark sweep results, floundering log, and lessons learned.
 
 **OpenCode setup:** [`docs/OPENCODE_SETUP.md`](docs/OPENCODE_SETUP.md) — configuring VITRIOL as an OpenCode provider, why `vitriol setup` is required, workflow recommendations.
 
@@ -61,16 +68,18 @@ The problem: the best open-weight models are MoE architectures (Mixture of Exper
 
 VITRIOL's insight: MoE models only activate ~2-8 out of 256 experts per token. The expert weights don't need to live in VRAM. Keep them in **page-locked system RAM** instead — the GPU reads them over PCIe DMA on demand. The base model, attention weights, KV cache, and compute buffers stay in VRAM. Only the experts are offloaded.
 
-**Result:** 6.9 tok/s on a GTX 1070 Ti (8 GB) with a 34.66B-parameter 256-expert model. The model doesn't fit at all without VITRIOL.
+**Result:** 10.96 tok/s on a GTX 1070 Ti (8 GB) with a 34.66B-parameter 256-expert model — **+92% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL.
 
 | Metric | Value |
 |--------|-------|
 | Model | Qwen3.6-35B-A3B (34.66B, 256 MoE experts) |
-| GPU | GTX 1070 Ti (Pascal, 8 GB VRAM) |
-| Generation | **6.9 tok/s** |
+| GPU | GTX 1070 Ti (Pascal, 8 GB VRAM, PCIe Gen3 x16) |
+| CPU | Intel 4th gen (Haswell, no AVX2) |
+| Generation (MTP N=2) | **10.96 tok/s** |
+| Generation (no MTP) | 9.1 tok/s |
 | VRAM saved | ~10 GB (experts stay in host RAM) |
-| System RAM used | 10 GB (page-locked, never swapped) |
-| VRAM used | ~1.3 GiB (base model + KV cache + compute) |
+| System RAM used | ~11.5 GiB (10040 MiB buffer + 1406 MiB host KV) |
+| VRAM used | ~1.3 GiB (non-MTP) / ~1.6 GiB (with MTP head) |
 
 
 ## How It Works
@@ -100,28 +109,31 @@ VITRIOL buffer type
 
 The key flag is **`is_host=true`**. When the graph scheduler sees this on a buffer type it supports (via `supports_buft`), it treats the tensor as host-resident and keeps it in system memory. The CUDA backend accesses `src0->data` directly — the GPU's DMA engine fetches the bytes over PCIe when the kernel reads from that address.
 
-### LRU VRAM Cache
+### LRU VRAM Cache (Inactive for Quantized Models)
 
-On top of the RAM Shot baseline, a small VRAM pool (~512 MB) caches frequently-used experts:
+The LRU cache was designed to keep hot expert weights in a VRAM pool (~512 MB) for faster
+access via native GDDR5 bandwidth. **However, it is never reached for quantized MoE models**
+(Q2_K_XL, IQ2_M, etc.) because the MMQ fast path in `ggml_cuda_mul_mat_id` returns before
+the LRU code. See [`docs/LRU_DIAGNOSTIC_FINDING.md`](docs/LRU_DIAGNOSTIC_FINDING.md) for the
+full diagnosis.
 
-- **Cache hit:** Expert weights in VRAM → native GDDR5 bandwidth matmul
-- **Cache miss:** Async `cuMemcpyHtoDAsync` from page-locked host to VRAM pool on a dedicated CUDA stream, synced via `cuStreamWaitEvent` before matmul starts
-- **Eviction:** LRU order via `std::list` + `unordered_map`. Composite key `(tensor_base_address, expert_idx)` prevents cross-layer collisions
-- **Slot sizing:** Fixed at first allocation; larger experts bypass cache and read from host
+Future VITRIOL-level Expert Pinning (see [`docs/OPTIMIZATIONS_2026-05-19.md`](docs/OPTIMIZATIONS_2026-05-19.md))
+will provide the same benefit — keeping frequent experts in VRAM — without modifying
+llama.cpp's kernel dispatch.
 
 ### Fast Path vs Slow Path
 
 llama.cpp's `ggml_cuda_mul_mat_id` has three paths for MoE matmuls:
 
-| Path | Trigger | Expert Data Access | LRU Cache? |
-|------|---------|-------------------|------------|
-| **MMVQ** | Batch ≤ 8, quantized weights | Reads `src0->data` directly with expert bounds | No (reads host directly) |
-| **MMQ** | Large batch, quantized | Reads `src0->data` directly with expert bounds | No (reads host directly) |
-| **cuBLAS (slow path)** | Everything else | Creates per-expert tensor slices, calls `ggml_cuda_mul_mat` per slice | **Yes** — replaces `src0_slice.data` with VRAM pool pointer on cache hit |
+| Path | Trigger | Expert Data Access | VITRIOL? |
+|------|---------|-------------------|----------|
+| **MMVQ** | Batch ≤ 8, quantized weights | Reads `src0->data` directly with expert bounds | Yes — host DMA |
+| **MMQ** | Large batch, quantized | Reads `src0->data` directly with expert bounds | Yes — host DMA |
+| **cuBLAS (slow path)** | Everything else | Per-expert tensor slices | No — FP16 only |
 
-The fast paths (MMVQ/MMQ) access the entire expert weight tensor through `src0->data` using expert bounds computed on GPU. Since the tensor is in page-locked host memory, the GPU reads it over PCIe DMA per-access. The LRU cache doesn't apply here — the data is interleaved in a single buffer.
-
-The slow path (cuBLAS) slices the tensor into per-expert views. Each slice's `data` pointer is checked against the LRU cache. On hit, the pointer points to VRAM. On miss, the pointer points to host RAM and a copy is queued for next time.
+For quantized models, the MMQ/MMVQ fast paths handle all inference. They read expert
+weights directly from the page-locked host buffer over PCIe DMA. The cuBLAS slow path
+(which has LRU support) is never reached for quantized types.
 
 ### Why Not Just Load Everything Into VRAM?
 
@@ -130,8 +142,9 @@ Because it doesn't fit. Qwen3.6-35B-A3B at UD-Q2_K_XL is 11.44 GiB. The GTX 1070
 With VITRIOL:
 - Base model weights (non-expert): ~1.3 GiB in VRAM
 - Expert weights: 0 GiB in VRAM (host RAM only)
-- KV cache + compute: ~225 MiB in VRAM
-- **Total VRAM: ~1.5 GiB** — leaving 6.5 GiB free for larger context or other workloads
+- KV cache + compute: ~1.4 GiB (host, Q4_0) + ~215 MiB (VRAM, compute buffers)
+- MTP head (optional): +302 MiB in VRAM
+- **Total VRAM: ~1.5 GiB (non-MTP) / ~1.8 GiB (MTP)** — leaving 6.2+ GiB free
 
 
 ## CLI Reference
@@ -154,8 +167,11 @@ Run options:
   -c N           context window (tokens)
   -t N           CPU threads
   -ngl N         GPU layers to offload
-  -lru MB        LRU VRAM cache size
+  -lru MB        LRU VRAM cache size (inactive for quantized models)
   --memory-mode MODE  emulated memory: on | off (default: off)
+  --kv-quant MODE     KV cache quantization: f16 | q8_0 | q4_0 (must be q4_0 for 256K)
+  --spec-type TYPE    speculative decoding: mtp | draft (default: disabled)
+  --spec-draft-n-max N  tokens to draft per cycle (default: 0, recommended: 2)
   --verbose      enable debug logging
   --dry-run      print config without launching
 
@@ -164,11 +180,14 @@ Serve options:
   -c N           context window (tokens)
   -t N           CPU threads
   -ngl N         GPU layers to offload
-  -lru MB        LRU VRAM cache size
+  -lru MB        LRU VRAM cache size (inactive for quantized models)
   --host ADDR    bind address (default: 127.0.0.1)
   -port N        server port (default: 8279)
   -p N           parallel slots (default: 1)
   --memory-mode MODE  emulated memory: on | off (default: off)
+  --kv-quant MODE     KV cache quantization: f16 | q8_0 | q4_0 (must be q4_0 for 256K)
+  --spec-type TYPE    speculative decoding: mtp | draft (default: disabled)
+  --spec-draft-n-max N  tokens to draft per cycle (default: 0, recommended: 2)
   --detach       run server in background
   --verbose      enable debug logging
   --dry-run      print config without launching
@@ -182,10 +201,7 @@ Use `vitriol serve --detach` for background API mode, `vitriol stop` to shut dow
 
 | Mode | What it does |
 |------|-------------|
-| **stream** | **(Default)** RAM Shot + LRU VRAM cache. Experts in page-locked host RAM. Hot experts in 512 MB VRAM pool. Best perf/VRAM tradeoff. |
-| **sync** | Preloads expert data synchronously before each matmul. No LRU cache. Every expert read over PCIe DMA. |
-| **async** | Double-buffer prefetch on separate CUDA stream. Hides DMA latency behind compute. |
-| **off** | VITRIOL inactive. Falls through to normal llama.cpp (OOM on 8 GB GPU). |
+| **stream** | **(Default, only active mode.)** RAM Shot + VITRIOL DMA. All expert weights in page-locked host RAM. GPU reads them over PCIe DMA on demand. MTP head (if enabled) loads through the same buffer. |
 
 ### Memory Mode (Experimental)
 
@@ -209,34 +225,61 @@ Configure via `vitriol config` (TUI option 4) or `vitriol serve --memory-mode on
 
 ## Performance
 
-| Metric | RAM Shot only | + LRU Cache |
-|--------|---------------|-------------|
-| Prompt eval (fast path) | 33.86 tok/s | 22.4 tok/s |
-| Prompt eval (slow path) | — | 14.3 tok/s |
-| Generation | **6.31 tok/s** | **6.9 tok/s** |
-| VRAM used | **1.3 GiB** | **~1.8 GiB** |
-| System RAM | +10 GiB | +10 GiB |
-| Model load | ~64 s | ~64 s |
+### Current Best: 10.96 tok/s
 
-The model (11.44 GiB) does **not fit** in 8 GB VRAM without VITRIOL.
+System: GTX 1070 Ti (PCIe Gen3 x16), 15 GB RAM, IQ2_M model, MTP N=2, 256K context, Q4_0 KV.
+
+| Config | Gen (tok/s) | vs x8 baseline |
+|--------|------------|----------------|
+| PCIe x8 (GTX 960 present, no VITRIOL) | 5.7 | — |
+| PCIe x16 (GTX 960 removed, Q2_K_XL) | 9.1 | +60% |
+| + MTP N=2 (IQ2_M model) | **10.96** | **+92%** |
+
+**Key finding:** MTP acceptance rate = exactly `1/N` — N=2 is optimal. Higher draft values waste PCIe bandwidth on rejected tokens.
+
+See full sweep data in [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md#mtp-draft-n-max-sweep-2026-05-19) and [`docs/FINDINGS_2026-05-19.md`](docs/FINDINGS_2026-05-19.md#mtp-draft-n-max-sweep-2026-05-19).
+
+### VRAM at 256K Context
+
+| Component | Non-MTP | With MTP Head |
+|-----------|---------|---------------|
+| Model weights (GPU) | ~1337 MiB | ~1337 + 302 MiB |
+| VITRIOL buffer (RAM) | ~10040 MiB | ~10040 MiB |
+| KV cache (host, Q4_0) | ~1406 MiB | ~1406 MiB |
+| Compute buffers | ~215 MiB | + overhead |
+| **Total VRAM** | **~1.3 GiB** | **~1.6 GiB** |
+| **Total system RAM** | **~11.5 GiB** | **~11.8 GiB** |
+| **VRAM headroom** | **~6.7 GiB** | **~6.4 GiB** |
 
 
 ## Hardware Targets
 
+> **PCIe warning:** If you have a secondary GPU in the second PCIe slot, the primary slot
+> may drop from x16 to x8. This halves PCIe bandwidth and reduces gen speed by ~60%.
+> VITRIOL is PCIe-bound — every token transfers ~40 MB of expert weights across the bus.
+> x8 bottleneck: ~5.7 tok/s. x16: ~9.1 tok/s (before MTP).
+
 | GPU | VRAM | Status | Notes |
 |-----|------|--------|-------|
-| GTX 1070 Ti | 8 GB | ✅ Verified | PCIe 3.0 x16, 6.9 tok/s |
-| GTX 960 | 2 GB | ⚠️ Limited | CC 5.2 lacks kernel images for some ops |
+| GTX 1070 Ti | 8 GB | ✅ Verified | PCIe 3.0 x16, **10.96 tok/s** (MTP N=2) |
 | RTX 3060 | 12 GB | ✅ Supported | More VRAM for larger KV cache |
 | RTX 4090 | 24 GB | ✅ Supported | PCIe 4.0 x16 → higher bandwidth |
+
+**CPU requirement:** VITRIOL uses the GPU as the primary MoE compute engine (experts
+streamed over PCIe DMA). The CPU is only an orchestrator — no AVX2 or fast CPU is
+required. This is in contrast to CPU-based expert offloading (e.g., KTransformers),
+which depends heavily on CPU vector extensions.
 
 ## Compatibility
 
 ### Tested
-- **GPU:** NVIDIA GeForce GTX 1070 Ti (CC 6.1, 8 GB VRAM)
-- **OS:** Linux — Ubuntu 24.04, kernel 6.17, NVIDIA driver 535.288.01, CUDA 12.2
-- **Model:** Qwen3.6-35B-A3B-UD-Q2_K_XL (256 experts, 34.66B params)
-- **llama.cpp:** Pinned submodule commit `4f7e33b5b`
+- **GPU:** NVIDIA GeForce GTX 1070 Ti (CC 6.1, 8 GB VRAM, PCIe Gen3 x16)
+- **CPU:** Intel 4th gen (Haswell, no AVX2) — only orchestrates, does not compute experts
+- **RAM:** 15 GB DDR3 system, NVMe SSD
+- **OS:** Linux — Ubuntu 24.04, kernel 6.17+, NVIDIA driver 535.288.01, CUDA 12.2
+- **Models:** Qwen3.6-35B-A3B-UD-Q2_K_XL (baseline, ~2.2 bpw) / IQ2_M (MTP-capable, ~2.6 bpw)
+- **llama.cpp:** Pinned submodule with VITRIOL CUDA integration
+- **Context:** 256,000 tokens at Q4_0 KV quant (—cache-type-k/q4_0 required)
 
 ### Likely works
 - **NVIDIA GPUs with CC ≥ 5.0:** All Pascal, Turing, Ampere, Ada, Blackwell cards. The `cudaHostRegister` + PCIe DMA path is architecture-agnostic. Higher VRAM GPUs benefit from larger LRU cache or keeping more layers in VRAM.
@@ -339,6 +382,10 @@ See `docs/EMULATED_MEMORY_ARCHITECTURE.md` for the full design (DB schema, scori
 ├── docs/
 │   ├── OPTIMIZATION_PLAN.md (V2)           ← 4-layer roadmap with citations
 │   ├── OPTIMIZATION_PLAN_V1.md             ← Preserved original
+│   ├── OPTIMIZATIONS_2026-05-19.md         ← Optimization catalog with prior art
+│   ├── RECOMMENDED_SETTINGS.md             ← Optimal config for this system
+│   ├── FINDINGS_2026-05-19.md              ← Benchmark sweeps, floundering log
+│   ├── BENCHMARK_RESULTS.md               ← All benchmark data across configs
 │   └── EMULATED_MEMORY_ARCHITECTURE.md     ← Memory design doc
 ├── EXPERIMENT_LOG.md        ← Complete test history (10 experiments)
 ├── SESSION_LOG_2026-05-17.md ← This session's progress report
@@ -381,6 +428,11 @@ VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe,
 
 | Paper / Project | What We Learned |
 |-----------------|-----------------|
+| **[Fate](https://arxiv.org/abs/2502.12224)** — Fang et al. (2025) | Cross-layer expert prefetching: gate inputs from adjacent layers are ~99% correlated, enabling 97%+ prefetch accuracy with zero GPU overhead. Working third-party llama.cpp fork at `github.com/ongunm/llama-moe-cache` reports 1.91× on Qwen3-30B-A3B. |
+| **[PreScope](https://arxiv.org/abs/2509.23638)** — Yu et al. (2025) | LLaPor lightweight predictor (0.5-2.8MB, 0.12-0.48ms), AsyncIO optimizer for overlapping PCIe transfers with GPU compute, cross-layer scheduler. 141% throughput improvement on Qwen3-30B-A3B. |
+| **[HOBBIT](https://arxiv.org/abs/2411.01433)** — Tang et al. (2024) | Mixed-precision expert offloading on llama.cpp (~8000 lines). Token-level dynamic loading, layer-level adaptive prefetching, multi-dimensional expert cache. Up to 9.93× decoding speedup on edge devices. Code not open-sourced. |
+| **[SP-MoE](https://arxiv.org/abs/2510.10302)** — Chen et al. (2025) | First SD-aware expert offloading: uses draft model's attention outputs to predict target model's expert activations. Combines MTP with expert prefetching. 1.07×-3.5× TPOT speedup. |
+| **[MTP](https://arxiv.org/abs/2404.19737)** — Gloeckle et al. (Meta, 2024) | Proved that training models to predict N tokens at once improves reasoning and enables parallel decoding. Foundation of our MTP speculative decoding via Unsloth IQ2_M model. |
 | **[Speculative Sampling](https://arxiv.org/abs/2211.17192)** — Leviathan et al. (Google, 2022) | Proved that verification of token sequences is parallelizable — checking 5 tokens takes the same time as checking 1. Foundation of all speculative decoding. |
 | **[Speculative Sampling](https://arxiv.org/abs/2302.01318)** — Chen et al. (DeepMind, 2023) | Established rejection sampling math ensuring fast/slow model pair output is identical to the slow model alone. |
 | **[Medusa](https://github.com/FasterDecoding/Medusa)** — Cai et al. (2024) | Multiple lightweight decoding heads on a single model to predict +1, +2, +3 tokens ahead. No second model needed. |
