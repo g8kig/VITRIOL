@@ -41,6 +41,8 @@ DEFAULT_LOOKUP=0
 DEFAULT_ENGINE_MODE="vitriol-dma"
 DEFAULT_SPEC_TYPE=""
 DEFAULT_SPEC_DRAFT_N_MAX=0
+DEFAULT_EXPERT_COUNT=0
+DEFAULT_OUTPUT_CACHE="off"
 
 # ── config vars (set by parse_config) ────────────────────────────
 CFG_DEVICE="$DEFAULT_DEVICE"
@@ -64,6 +66,8 @@ CFG_LOOKUP="$DEFAULT_LOOKUP"
 CFG_ENGINE_MODE="$DEFAULT_ENGINE_MODE"
 CFG_SPEC_TYPE="$DEFAULT_SPEC_TYPE"
 CFG_SPEC_DRAFT_N_MAX="$DEFAULT_SPEC_DRAFT_N_MAX"
+CFG_EXPERT_COUNT="$DEFAULT_EXPERT_COUNT"
+CFG_OUTPUT_CACHE="$DEFAULT_OUTPUT_CACHE"
 
 # ═════════════════════════════════════════════════════════════════
 # CONFIG PARSING
@@ -111,6 +115,8 @@ parse_config() {
                 engine.mode)             CFG_ENGINE_MODE="$val" ;;
                 spec.type)             CFG_SPEC_TYPE="$val" ;;
                 spec.draft_n_max)      CFG_SPEC_DRAFT_N_MAX="$val" ;;
+                model.expert_count)    CFG_EXPERT_COUNT="$val" ;;
+                vitriol.output_cache)  CFG_OUTPUT_CACHE="$val" ;;
             esac
         fi
     done < "$CONFIG_FILE"
@@ -138,6 +144,8 @@ context = $CFG_CTX
 threads = $CFG_THREADS
 # GPU layers to offload
 ngl = $CFG_NGL
+# Expert count override (0 = model default, 4-8 recommended)
+expert_count = $CFG_EXPERT_COUNT
 
 [vitriol]
 # Operation mode: stream | sync | async | off
@@ -146,6 +154,8 @@ mode = $CFG_MODE
 lru_mb = $CFG_LRU_MB
 # Verbose logging
 verbose = $CFG_VERBOSE
+# Expert output caching: on | off (approximate — reuses previous token's expert outputs)
+output_cache = $CFG_OUTPUT_CACHE
 
 [server]
 # API host address
@@ -228,6 +238,8 @@ config_show() {
     print_row "Frozen Prompt:         " "${CFG_FROZEN_PROMPT}"
     print_row "KV Quant:              " "${CFG_KV_QUANT}"
     print_row "Prompt Lookup:         " "${CFG_LOOKUP}"
+    print_row "Expert Count:          " "${CFG_EXPERT_COUNT:-0} (0=default)"
+    print_row "Output Cache:          " "${CFG_OUTPUT_CACHE}"
     if [[ -n "$CFG_SPEC_TYPE" ]]; then
         local mtp_ok=""
         model_has_mtp "$CFG_MODEL" && mtp_ok=" (MTP detected)"
@@ -269,9 +281,11 @@ config_set() {
         model.context)         CFG_CTX="$val" ;;
         model.threads)         CFG_THREADS="$val" ;;
         model.ngl)             CFG_NGL="$val" ;;
+        model.expert_count)    CFG_EXPERT_COUNT="$val" ;;
         vitriol.mode)          CFG_MODE="$val" ;;
         vitriol.lru_mb)        CFG_LRU_MB="$val" ;;
         vitriol.verbose)       CFG_VERBOSE="$val" ;;
+        vitriol.output_cache)  CFG_OUTPUT_CACHE="$val" ;;
         server.host)           CFG_HOST="$val" ;;
         server.parallel)       CFG_PARALLEL="$val" ;;
         server.port)           CFG_PORT="$val" ;;
@@ -429,6 +443,8 @@ tui_model_menu() {
         printf "║  %-37s ║\n" "2) Context Window   [${CFG_CTX}]"
         printf "║  %-37s ║\n" "3) Threads          [${CFG_THREADS}]"
         printf "║  %-37s ║\n" "4) GPU Layers (ngl) [${CFG_NGL}]"
+        printf "║  %-37s ║\n" "5) Expert Count     [${CFG_EXPERT_COUNT:-0}]"
+        printf "║  %-37s ║\n" "6) Output Cache     [${CFG_OUTPUT_CACHE}]"
         printf "║  %-37s ║\n" "7) ${mtp_label}"
         if [[ -n "$CFG_SPEC_TYPE" ]]; then
             printf "║  %-37s ║\n" "8) Draft N-Max      [${CFG_SPEC_DRAFT_N_MAX:-0}]"
@@ -472,21 +488,21 @@ tui_model_menu() {
                 fi
                 ;;
             5)
-                echo "Options: f16 (FP16, default) | q8_0 (8-bit) | q4_0 (4-bit, max compression)"
-                read -r -p "Enter mode: " val
-                case "$val" in
-                    f16|q8_0|q4_0) config_set kv.quant_mode "$val" ;;
-                    *) echo "Invalid mode"; sleep 1 ;;
-                esac
+                echo "Expert count override (0 = model default, 4-8 recommended)"
+                read -r -p "Enter expert count: " val
+                if [[ "$val" =~ ^[0-9]+$ ]] && ((val == 0 || (val >= 1 && val <= 256))); then
+                    config_set model.expert_count "$val"
+                else
+                    echo "Invalid (must be 0-256, 0=default)"; sleep 1
+                fi
                 ;;
             6)
-                echo "Number of tokens to look ahead (0=disabled, 8-32 recommended)"
-                read -r -p "Enter tokens: " val
-                if [[ "$val" =~ ^[0-9]+$ ]] && ((val >= 0 && val <= 128)); then
-                    config_set lookup_tokens "$val"
-                else
-                    echo "Invalid (must be 0-128)"; sleep 1
-                fi
+                echo "Expert output caching: on | off (approximate — reuses previous token outputs)"
+                read -r -p "Enter mode: " val
+                case "$val" in
+                    on|off) config_set vitriol.output_cache "$val" ;;
+                    *) echo "Invalid (on|off)"; sleep 1 ;;
+                esac
                 ;;
             7)
                 echo "Speculative decoding type: mtp | draft (leave empty to disable)"
@@ -503,6 +519,23 @@ tui_model_menu() {
                     config_set spec.draft_n_max "$val"
                 else
                     echo "Invalid (must be 1-12)"; sleep 1
+                fi
+                ;;
+            9)
+                echo "KV cache quantization: f16 (FP16, default) | q8_0 (8-bit) | q4_0 (4-bit)"
+                read -r -p "Enter mode: " val
+                case "$val" in
+                    f16|q8_0|q4_0) config_set kv.quant_mode "$val" ;;
+                    *) echo "Invalid mode"; sleep 1 ;;
+                esac
+                ;;
+            10)
+                echo "Prompt lookup decoding tokens (0=disabled, 8-32 recommended)"
+                read -r -p "Enter tokens: " val
+                if [[ "$val" =~ ^[0-9]+$ ]] && ((val >= 0 && val <= 128)); then
+                    config_set lookup_tokens "$val"
+                else
+                    echo "Invalid (must be 0-128)"; sleep 1
                 fi
                 ;;
             b|B) return ;;
@@ -879,13 +912,14 @@ case "$CMD" in
         KV_QUANT="${CLI_KV_QUANT:-${CFG_KV_QUANT}}"
         LOOKUP="${CLI_LOOKUP:-${CFG_LOOKUP}}"
         ENGINE_MODE="${CLI_ENGINE_MODE:-${CLI_ENGINE_MODE:-${CFG_ENGINE_MODE}}}"
-        DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
+DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         SPEC_TYPE="${CLI_SPEC_TYPE:-${CFG_SPEC_TYPE}}"
         SPEC_DRAFT_N_MAX="${CLI_SPEC_DRAFT_N_MAX:-${CFG_SPEC_DRAFT_N_MAX}}"
+        EXPERT_COUNT="${CFG_EXPERT_COUNT}"
+        OUTPUT_CACHE="${CFG_OUTPUT_CACHE}"
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
-        # GPU visibility
         if [[ "$CFG_EXCLUDE_SECONDARY" == "true" ]]; then
             CUDA_DEVICES="${DEVICE}"
         else
@@ -968,6 +1002,8 @@ case "$CMD" in
             VITRIOL_LOOKUP="$LOOKUP" \
             VITRIOL_ENGINE_MODE="$ENGINE_MODE" \
             VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
+            VITRIOL_EXPERT_COUNT="$EXPERT_COUNT" \
+            VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
             VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
             $ENV_VERBOSE \
@@ -1151,6 +1187,8 @@ case "$CMD" in
                     VITRIOL_LOOKUP="$LOOKUP" \
                     VITRIOL_ENGINE_MODE="$ENGINE_MODE" \
                     VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
+                    VITRIOL_EXPERT_COUNT="$EXPERT_COUNT" \
+                    VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
@@ -1197,6 +1235,8 @@ case "$CMD" in
                     VITRIOL_LOOKUP="$LOOKUP" \
                     VITRIOL_ENGINE_MODE="$ENGINE_MODE" \
                     VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
+                    VITRIOL_EXPERT_COUNT="$EXPERT_COUNT" \
+                    VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
@@ -1243,6 +1283,8 @@ case "$CMD" in
                     VITRIOL_LOOKUP="$LOOKUP" \
                     VITRIOL_ENGINE_MODE="$ENGINE_MODE" \
                     VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
+                    VITRIOL_EXPERT_COUNT="$EXPERT_COUNT" \
+                    VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
@@ -1287,6 +1329,8 @@ case "$CMD" in
                     VITRIOL_LOOKUP="$LOOKUP" \
                     VITRIOL_ENGINE_MODE="$ENGINE_MODE" \
                     VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
+                    VITRIOL_EXPERT_COUNT="$EXPERT_COUNT" \
+                    VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
