@@ -619,12 +619,22 @@ VITRIOL_PIN_FIRST_N_LAYERS=15
 - Both findings are consistent with the literature but were not verified until now due to missing quality checks in benchmarks
 
 ### What's Next
-- Real ceiling: **9.12 t/s** on Q2_K_XL (or ~9.2-9.3 on IQ2_M)
-- MTP N=2 via llama-bench: **10.96 t/s** (requires separate benchmark setup)
-- T-MAC or hardware upgrade needed to meaningfully break the compute bound
+- **IQ2_M tokenizer fix**: Investigate and fix the `?` output from IQ2_M GGUF — likely chat template metadata with `thinking = 1`. Compare metadata between Q2_K_XL and IQ2_M using `gguf` Python tools, try `--override-kv`, or patch the GGUF.
+- **MTP N=2 benchmark**: Once IQ2_M works, re-run the MTP benchmark to verify 10.96 t/s with clean output.
+- **T-MAC / hardware upgrade**: The 9.12 t/s ceiling is real. T-MAC (TQ1_0 format) or a GPU upgrade are the only paths to significantly higher throughput.
 
-### Modified Files (this session)
-- All prune, output cache, pinning code remains in the codebase
-- Config reset to safe defaults (pin=15, prefetch=on, prune=0, cache=off, spec=off)
+### Final Production Config (2026-05-20)
+```
+model.path  = /home/randozart/Downloads/koboldcpp/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
+model.context = 256000
+vitriol.mode = stream
+vitriol.pin_first_n_layers = 15
+vitriol.predictive_prefetch = on
+vitriol.output_cache = off
+vitriol.prune_experts = 0
+spec.type = (empty)
+spec.draft_n_max = 0
+```
+→ **9.12 t/s** with verified clean output.
 
-*Last updated: 2026-05-20 15:30 CEST*
+*Last updated: 2026-05-20 16:00 CEST*
