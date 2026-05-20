@@ -1636,10 +1636,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
             -c "${CTX}" \
             -p 64 \
             -n "$N" \
-            -t 4 2>&1 
-
-    bench)
-        # parsed above in the bench section
+            -t 4 2>&1
         ;;
 
     config)

@@ -36,7 +36,7 @@ VITRIOL has several feature flags that control memory, context efficiency, and r
 | Flag | Effect | tok/s impact | Use Case |
 |------|--------|-------------|----------|
 | `--spec-type mtp` / `--spec-draft-n-max 2` | MTP speculative decoding (+20% gen) | +20% | Max throughput (requires MTP-capable model) |
-| `--prune-experts N` | Top-K pruning: drop bottom N of 8 experts | +21.5% | Max throughput (experimental, may affect quality) |
+| `--prune-experts N` | Top-K pruning: drop bottom N of 8 experts | +16% | Max throughput (experimental, may affect quality) |
 | `--cache-type-k q4_0` / `--cache-type-v q4_0` | KV cache quantized to 4-bit | Required at 256K | Reduces host KV from 5000→1406 MiB; without it, RAM exceeds 15 GB |
 | `--kv-mode offload` | KV cache in host RAM | Enables 256K context | Long context coding |
 | `--kv-mode sparse` | Attention-score eviction (4-8x compression) | Saves host RAM | Extreme context length |
