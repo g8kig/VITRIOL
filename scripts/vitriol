@@ -46,6 +46,7 @@ DEFAULT_OUTPUT_CACHE="off"
 DEFAULT_PREDICTIVE_PREFETCH="off"
 DEFAULT_PIN_FIRST_N_LAYERS=0
 DEFAULT_PRUNE_EXPERTS=0
+DEFAULT_REASONING="off"
 
 # ── config vars (set by parse_config) ────────────────────────────
 CFG_DEVICE="$DEFAULT_DEVICE"
@@ -74,6 +75,7 @@ CFG_OUTPUT_CACHE="$DEFAULT_OUTPUT_CACHE"
 CFG_PREDICTIVE_PREFETCH="$DEFAULT_PREDICTIVE_PREFETCH"
 CFG_PIN_FIRST_N_LAYERS="$DEFAULT_PIN_FIRST_N_LAYERS"
 CFG_PRUNE_EXPERTS="$DEFAULT_PRUNE_EXPERTS"
+CFG_REASONING="$DEFAULT_REASONING"
 
 # ═════════════════════════════════════════════════════════════════
 # CONFIG PARSING
@@ -126,6 +128,7 @@ parse_config() {
                  vitriol.predictive_prefetch) CFG_PREDICTIVE_PREFETCH="$val" ;;
                  vitriol.pin_first_n_layers) CFG_PIN_FIRST_N_LAYERS="$val" ;;
                  vitriol.prune_experts)     CFG_PRUNE_EXPERTS="$val" ;;
+                 vitriol.reasoning)         CFG_REASONING="$val" ;;
             esac
         fi
     done < "$CONFIG_FILE"
@@ -176,6 +179,8 @@ pin_first_n_layers = $CFG_PIN_FIRST_N_LAYERS
 #   0 = off (default), 2 = compute 6 experts, 4 = compute 4 experts
 #   Experimental: may affect output quality, especially for creative tasks.
 prune_experts = $CFG_PRUNE_EXPERTS
+# Reasoning/thinking mode: on | off (off disables thinking, required for Qwen3.6)
+reasoning = $CFG_REASONING
 
 [server]
 # API host address
@@ -266,6 +271,7 @@ config_show() {
         local keep=$((8 - CFG_PRUNE_EXPERTS))
         print_row "Expert Pruning:        " "drop ${CFG_PRUNE_EXPERTS} (keep ${keep})"
     fi
+    print_row "Reasoning:             " "${CFG_REASONING:-on}"
     if [[ -n "$CFG_SPEC_TYPE" ]]; then
         local mtp_ok=""
         model_has_mtp "$CFG_MODEL" && mtp_ok=" (MTP detected)"
@@ -286,6 +292,7 @@ config_reset() {
     CFG_EXCLUDE_SECONDARY="$DEFAULT_EXCLUDE_SECONDARY"
     CFG_PIN_FIRST_N_LAYERS="$DEFAULT_PIN_FIRST_N_LAYERS"
     CFG_PRUNE_EXPERTS="$DEFAULT_PRUNE_EXPERTS"
+    CFG_REASONING="$DEFAULT_REASONING"
     CFG_MODEL="$DEFAULT_MODEL"
     CFG_CTX="$DEFAULT_CTX"
     CFG_THREADS="$DEFAULT_THREADS"
@@ -317,6 +324,7 @@ config_set() {
         vitriol.predictive_prefetch) CFG_PREDICTIVE_PREFETCH="$val" ;;
         vitriol.pin_first_n_layers) CFG_PIN_FIRST_N_LAYERS="$val" ;;
         vitriol.prune_experts)     CFG_PRUNE_EXPERTS="$val" ;;
+        vitriol.reasoning)         CFG_REASONING="$val" ;;
         server.host)           CFG_HOST="$val" ;;
         server.parallel)       CFG_PARALLEL="$val" ;;
         server.port)           CFG_PORT="$val" ;;
@@ -613,11 +621,12 @@ tui_vitriol_menu() {
         printf "║  %-37s ║\n" "3) Verbose Logging  [${CFG_VERBOSE}]"
         printf "║  %-37s ║\n" "4) Predictive Prefetch [${CFG_PREDICTIVE_PREFETCH}]"
         printf "║  %-37s ║\n" "5) Expert Pin Layers  [${CFG_PIN_FIRST_N_LAYERS}]"
+        printf "║  %-37s ║\n" "6) Reasoning Mode     [${CFG_REASONING}]"
         printf "║  %-37s ║\n" "b) Back to Main Menu"
         printf "║  %-37s ║\n" "q) Quit"
         echo "╚══════════════════════════════════════════╝"
         echo ""
-        read -r -p "Select [1-5/b/q]: " choice
+        read -r -p "Select [1-6/b/q]: " choice
         case "$choice" in
             1)
                 echo "Modes: stream (RAM Shot + LRU) | sync | async | off"
@@ -675,6 +684,23 @@ tui_vitriol_menu() {
                 else
                     echo "Invalid (must be 0-40)"; sleep 1
                 fi
+                ;;
+            6)
+                echo ""
+                echo "Reasoning Mode: controls whether the model generates"
+                echo "thinking/reasoning tokens before the response."
+                echo ""
+                echo "  Qwen3.6 models require 'off' to avoid garbled output."
+                echo "  Other models: 'on' (auto-detect from template)."
+                echo ""
+                if [[ "$CFG_REASONING" == "off" ]]; then
+                    config_set vitriol.reasoning "on"
+                    echo "  → Reasoning set to on (auto-detect)"
+                else
+                    config_set vitriol.reasoning "off"
+                    echo "  → Reasoning set to off (required for Qwen3.6)"
+                fi
+                sleep 1
                 ;;
             b|B) return ;;
             q|Q) clear; exit 0 ;;
@@ -1003,6 +1029,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         SPEC_DRAFT_N_MAX="${CLI_SPEC_DRAFT_N_MAX:-${CFG_SPEC_DRAFT_N_MAX}}"
         EXPERT_COUNT="${CFG_EXPERT_COUNT}"
         OUTPUT_CACHE="${CFG_OUTPUT_CACHE}"
+        REASONING="${CLI_REASONING:-${CFG_REASONING}}"
         PREDICTIVE_PREFETCH="${CFG_PREDICTIVE_PREFETCH}"
         PIN_FIRST_N_LAYERS="${CLI_PIN_LAYERS:-${CFG_PIN_FIRST_N_LAYERS}}"
         PRUNE_EXPERTS="${CLI_PRUNE_EXPERTS:-${CFG_PRUNE_EXPERTS}}"
@@ -1072,6 +1099,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
             prune_keep=$((8 - PRUNE_EXPERTS))
             echo "  Expert Prune: $PRUNE_EXPERTS (keeping $prune_keep of 8)"
         fi
+        [[ "${REASONING}" == "off" ]] && echo "  Reasoning:    off (Qwen3.6 mode)"
         echo "  Binary:      $BINARY"
         echo "  Port:        $PORT"
         [[ "$VERBOSE" == "true" ]] && echo "  Logging:     verbose"
@@ -1146,6 +1174,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         CLI_SPEC_DRAFT_N_MAX=""
         CLI_PIN_LAYERS=""
         CLI_PRUNE_EXPERTS=""
+        CLI_REASONING=""
         DETACH=false
         DRY_RUN=false
 
@@ -1171,6 +1200,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                 --disk-offload) CLI_DISK_OFFLOAD="1"; shift ;;
                 --pin-layers) CLI_PIN_LAYERS="$2"; shift 2 ;;
                 --prune-experts) CLI_PRUNE_EXPERTS="$2"; shift 2 ;;
+                --reasoning) CLI_REASONING="$2"; shift 2 ;;
                 --detach) DETACH=true; shift ;;
                 --verbose) CLI_VERBOSE="true"; shift ;;
                 --dry-run) DRY_RUN=true; shift;;
@@ -1200,6 +1230,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         SPEC_DRAFT_N_MAX="${CLI_SPEC_DRAFT_N_MAX:-${CFG_SPEC_DRAFT_N_MAX}}"
         EXPERT_COUNT="${CFG_EXPERT_COUNT}"
         OUTPUT_CACHE="${CFG_OUTPUT_CACHE}"
+        REASONING="${CFG_REASONING}"
         PREDICTIVE_PREFETCH="${CFG_PREDICTIVE_PREFETCH}"
         PIN_FIRST_N_LAYERS="${CLI_PIN_LAYERS:-${CFG_PIN_FIRST_N_LAYERS}}"
         PRUNE_EXPERTS="${CLI_PRUNE_EXPERTS:-${CFG_PRUNE_EXPERTS}}"
@@ -1264,6 +1295,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
             prune_keep=$((8 - PRUNE_EXPERTS))
             echo "  Expert Prune: $PRUNE_EXPERTS (keeping $prune_keep of 8)"
         fi
+        [[ "${REASONING}" == "off" ]] && echo "  Reasoning:    off (Qwen3.6 mode)"
         if [[ "$MEMORY_MODE" == "on" ]]; then
             LLAMA_PORT=$((PORT - 1))
             echo "  Server:      http://${HOST}:${LLAMA_PORT} (llama-server, internal)"
@@ -1294,8 +1326,9 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && SPEC_ARGS="$SPEC_ARGS --spec-draft-n-max $SPEC_DRAFT_N_MAX"
         # Flash Attention is required for V cache quantization and generally faster
         FA_ARGS="-fa on"
-        # Reasoning off is required for Qwen3.6 models (thinking mode corrupts output)
-        REASONING_ARGS="--reasoning off"
+        # Reasoning/thinking mode: off for Qwen3.6 models
+        REASONING_ARGS=""
+        [[ "${REASONING}" == "off" ]] && REASONING_ARGS="--reasoning off"
 
         if $DETACH; then
             echo "Starting server in background..."
