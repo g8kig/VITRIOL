@@ -32,7 +32,6 @@ from textual.widgets import (
 )
 from textual.screen import Screen, ModalScreen
 from textual.message import Message
-from textual import validate
 
 
 # ── Paths ──────────────────────────────────────────────────────
@@ -281,7 +280,7 @@ class ServerLaunchScreen(ModalScreen):
     def on_mount(self):
         self.launch()
 
-    @work(thread=True, exit_if_already_running=True)
+    @work(thread=True)
     def launch(self):
         try:
             result = subprocess.run(
@@ -474,7 +473,7 @@ class DashboardScreen(Screen):
             pass
         self._do_launch()
 
-    @work(thread=True, exit_if_already_running=True)
+    @work(thread=True)
     def _do_launch(self):
         try:
             result = subprocess.run(
