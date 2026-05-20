@@ -628,4 +628,13 @@ No pin, no LRU, no predictor, no MTP.
 | `ggml-cuda.cu` | Prune gates on all 4 fast-path conditions; prune logic in sorted path |
 | `scripts/vitriol` | `prune_experts` config key, TUI option 11, `--prune-experts` CLI, env passthrough |
 
-*Last updated: 2026-05-20 11:45 CEST*
+*Last updated: 2026-05-20 14:30 CEST*
+
+---
+
+## Next Sprint: Early Exit (Planned)
+
+**Status:** 💡 Plan written — `.opencode/plans/EARLY_EXIT.md`
+**Approach:** Residual delta-norm detection + graph view slicing
+**Expected gain:** +30-50% combined with prune+cache (exit at layer 20-25)
+**Key risk:** `ggml_graph_view()` compatibility with CUDA backend scheduler
