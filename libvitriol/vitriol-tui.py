@@ -505,7 +505,7 @@ class DashboardScreen(Screen):
                 pass
 
     def action_config(self):
-        self.push_screen(ConfigScreen())
+        self.app.push_screen(ConfigScreen())
 
     def action_launch(self):
         self.launch_server()
