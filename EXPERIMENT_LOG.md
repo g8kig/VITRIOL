@@ -570,4 +570,66 @@ Four approaches documented in `.opencode/plans/`:
 3. **Early Exit** (`EARLY_EXIT.md`) — Skip layers 21-40 when residual stabilizes. Saves 50% compute.
 4. **Asymmetric Pinning + Cache** (`ASYMMETRIC_PIN_CACHE.md`) — Pin early layers (compute-bound, no cache benefit), output-cache late layers (sluggish residual, high cache hit rate).
 
-*Last updated: 2026-05-20 11:10 CEST*
+---
+
+## Experiment 15: Expert Pinning + Top-K Pruning
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-05-20 |
+| **Status** | ✅ Implemented and benchmarked |
+
+### Part A: Expert Pinning (Tensor-Level VRAM Preload)
+
+Pre-load full expert weight tensors (all 256 experts) of the first N layers into VRAM. Redirect `src0->data` before fast-path kernels. +4% decode gain — confirms compute-bound, not PCIe-bound.
+
+**Monolithic pool safety fix:** Replaced per-tensor `cuMemAlloc` with single pre-allocated pool to prevent VRAM fragmentation.
+
+### Part B: Top-K Expert Pruning
+
+Drop bottom N of 8 active experts before matmul. Forces the sorted path (fast-path skipped) when active. No kernel changes — just zeros `tokens_per_expert[]`.
+
+### Benchmark Results
+
+| # | Configuration | tg100 (t/s) | vs baseline |
+|---|---|---|---|
+| 0 | Baseline (fast path, no opts) | 8.94 | — |
+| 1 | Pin 15 (fast path) | 9.30 | +4.0% |
+| 2 | Prune 2 (sorted path) | 9.60 | +7.4% |
+| 3 | Prune 4 (sorted path) | 10.10 | +13.0% |
+| 4 | Prune 4 + pin 15 (sorted path) | 10.30 | +15.2% |
+| 5 | **Prune 4 + output cache=1** | **10.86** | **+21.5%** |
+| 6 | Prune 6 + output cache=1 | 10.92 | +22.1% |
+| 7 | All combos (prune+pin+cache+LRU+prefetch) | 10.28 | +15.0% |
+
+**Best config for GTX 1070 Ti / Qwen3.6-35B-A3B:**
+```
+VITRIOL_MODE=stream
+VITRIOL_PRUNE_EXPERTS=4
+VITRIOL_OUTPUT_CACHE=1
+```
+
+### Key Findings
+
+1. **Prune=4 + output cache** is the dominant combo (+21.5%). Pinning, LRU, and predictor contribute nothing on top because:
+   - Pruning forces the sorted path (where output cache lives)
+   - Output cache already provides expert-level reuse across tokens
+   - LRU/predictor are redundant with output cache
+   - Pinning only helps the fast path (which is skipped for pruning)
+
+2. **Pinning is an architectural dead end** for this GPU. The compute bottleneck is ALU saturation, not PCIe bandwidth. Pinning helps (+4%) but the gain is capped.
+
+3. **Prune=6 adds negligible gain** over prune=4 → diminishing returns on expert count reduction.
+
+4. **Theoretical ceiling ~16 t/s.** At 10.86 t/s we're at ~68% of Pascal's compute peak. To go higher: T-MAC (bypass ALU entirely) or Early Exit (skip layers).
+
+### Modified Files
+
+| File | Changes |
+|------|---------|
+| `vitriol-cuda-integration.h` | Added `prune_experts` to config; `vitriol_prune_experts()` inline |
+| `vitriol-cuda-integration.cpp` | Monolithic pin pool; prune env var read |
+| `ggml-cuda.cu` | Prune gates on all 4 fast-path conditions; prune logic in sorted path |
+| `scripts/vitriol` | `prune_experts` config key, TUI option 11, `--prune-experts` CLI, env passthrough |
+
+*Last updated: 2026-05-20 11:45 CEST*
