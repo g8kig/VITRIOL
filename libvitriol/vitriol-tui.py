@@ -287,11 +287,11 @@ class ServerLaunchScreen(ModalScreen):
                 ["bash", str(SCRIPT_PATH), "serve", "--detach", "--kv-mode", "offload"],
                 capture_output=True, text=True, timeout=300
             )
-            self.call_from_thread(self._update_status, result.returncode == 0)
+            self.app.call_from_thread(self._update_status, result.returncode == 0)
         except subprocess.TimeoutExpired:
-            self.call_from_thread(self._update_status, False, "Timeout")
+            self.app.call_from_thread(self._update_status, False, "Timeout")
         except Exception as e:
-            self.call_from_thread(self._update_status, False, str(e))
+            self.app.call_from_thread(self._update_status, False, str(e))
 
     def _update_status(self, success: bool, msg: str = ""):
         if success:
@@ -383,7 +383,7 @@ class DashboardScreen(Screen):
     @work(thread=True)
     def poll_loop(self):
         while True:
-            self.call_from_thread(self._update)
+            self.app.call_from_thread(self._update)
             time.sleep(1)
 
     def _update(self):
@@ -481,10 +481,10 @@ class DashboardScreen(Screen):
                 capture_output=True, text=True, timeout=300
             )
             success = result.returncode == 0
-            self.call_from_thread(self._launch_result, success,
+            self.app.call_from_thread(self._launch_result, success,
                                   result.stderr.strip() or result.stdout.strip())
         except Exception as e:
-            self.call_from_thread(self._launch_result, False, str(e))
+            self.app.call_from_thread(self._launch_result, False, str(e))
 
     def _launch_result(self, success: bool, msg: str = ""):
         try:
