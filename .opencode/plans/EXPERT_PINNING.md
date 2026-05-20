@@ -1,5 +1,9 @@
 # Plan: Expert Pinning (PopFetcher/HOBBIT-style)
 
+**⚠️ SUPERSEDED by [EXPERT_PINNING_V2.md](EXPERT_PINNING_V2.md) and [MEMORY_OPTIMIZATIONS.md](MEMORY_OPTIMIZATIONS.md)**
+
+This was the original v1 design doc. V2 implemented the actual code with scoped `src0` redirect, monolithic VRAM pool, and proper benchmarking (+4% gain). See the master memory doc for current state.
+
 **Goal:** Pre-load frequently-used experts into VRAM at startup, eliminating their PCIe transfer cost during inference. MoE expert usage follows a power law — a tiny fraction handles most tokens.
 
 **Current bottleneck:** The MMV fast path (MMVQ/MMQ/MMF) reads ALL experts from the host memory tensor pointer via a single fused kernel launch. There is no per-expert VRAM redirection. Without kernel changes, pinning only helps the slow per-expert loop (2-3× slower, not worth it).

@@ -1,5 +1,11 @@
 # Plan: Graph Split Optimization + MTP/Prune Stacking
 
+**Status: ✅ Implemented**
+
+Fix applied: VITRIOL buffer type now shares CUDA host buffer type's `get_name` function pointer, making `ggml_backend_buft_is_cuda_host()` return true for VITRIOL buft. This tells the scheduler that VITRIOL weights are CUDA-host-compatible, preventing unnecessary graph splits.
+
+Benchmark verified: no regression at any configuration (baseline 9.21 t/s server, best 10.71 t/s prune+cache).
+
 ## Background
 
 VITRIOL currently produces **17 graph splits** vs **2 in all-VRAM** baseline (`GGML_SCHED_DEBUG=1`). Each split adds scheduler re-entry overhead and potential cross-backend tensor copies. Fixing this could give 10-15% throughput improvement across ALL configurations.

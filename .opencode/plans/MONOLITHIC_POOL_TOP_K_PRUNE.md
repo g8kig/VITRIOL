@@ -1,8 +1,9 @@
 # Plan: Monolithic Pin Pool + Top-K Expert Pruning
 
-## Sprint Goal
-Two complementary changes targeting the compute bottleneck:
-1. **Safety fix**: Replace per-tensor `cuMemAlloc` in expert pinning with a single monolithic pool
+**✅ IMPLEMENTED — Both changes are committed and benchmarked.**
+- Monolithic VRAM pool: integrated into `vitriol_pin_ensure()` (vitriol-cuda-integration.cpp)
+- Top-K Pruning: `VITRIOL_PRUNE_EXPERTS=4` + output cache → **10.71 t/s (+16%)**
+- See [MEMORY_OPTIMIZATIONS.md](MEMORY_OPTIMIZATIONS.md) and [COMPUTE_OPTIMIZATIONS.md](COMPUTE_OPTIMIZATIONS.md) for current status.
 2. **Top-K Pruning**: Drop bottom-N experts after routing to halve matmul work
 
 ---

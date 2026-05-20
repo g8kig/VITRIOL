@@ -1,5 +1,7 @@
 # Plan: Early Exit — Skip Layers via Residual Stagnation
 
+**Status: ✅ Implemented — Negative Result (model doesn't benefit)**
+
 **Problem:** At 10.71 t/s with prune=4 + output cache, we're at ~67% of Pascal's 16 t/s ceiling. The bottleneck is ALU saturation. To go higher, we need to **do less compute**, not make existing compute faster.
 
 **Idea:** Deep layers (21-40) often contribute negligibly to the output — the residual stream barely changes. By detecting this stagnation at runtime, we can skip remaining layers and jump directly to the output head. This can save **50% of compute** (skipping 20 of 40 layers).
@@ -187,3 +189,43 @@ Both output cache and pruning operate WITHIN a layer. Early exit operates BETWEE
 2. **Quality degradation** — Early exit changes the model's output distribution. For creative/novel tokens, later layers may be critical. Test with code vs prose.
 3. **Threshold sensitivity** — Too aggressive: gibberish. Too conservative: no gain. Needs systematic tuning.
 4. **Token type variance** — Function headers need full depth, closing brackets exit early. Adaptive threshold per token type (via tree-sitter AST) is a future improvement.
+
+---
+
+## Implementation Result (2026-05-20)
+
+All infrastructure was built and tested:
+
+1. **`llm_graph_params.n_build_layers`** — Controls how many layers the graph builder creates. `allow_reuse()` updated to detect changes.
+2. **Residual delta nodes** — `ggml_sub` + `ggml_sqr` + `ggml_sum_rows` added to each layer in the `qwen35moe.cpp` graph builder.
+3. **Host-side readback** — `ggml_backend_tensor_get()` after graph compute reads per-layer delta values.
+4. **Detection logic** — Stagnation counter increments when normalized L2 delta < threshold for N consecutive layers.
+5. **Graph rebuild** — When exit is detected, `n_build_layers` is set and the next batch rebuilds with fewer layers.
+
+### Negative Result: Model Architecture Resists Early Exit
+
+Per-layer deltas measured for the first prefill token:
+
+| Layer range | Delta (L2 ratio) | Behavior |
+|---|---|---|
+| 0-10 | 0.01 to 60 | Building syntax — rapid change |
+| 11-30 | 0.0001 to 0.003 | **Stagnation zone** — minimal change |
+| 31-38 | 0.06 to 1.4 | **Second compute wave** — vocabulary refinement |
+| 39 | N/A (output head) | Final norm + lm_head |
+
+The model has **two active compute phases** separated by a stagnation desert. Exiting at layer 11 (during stagnation) produces empty/garbage output because layers 31-38 are critical for vocabulary refinement. All 40 layers are genuinely needed.
+
+### Why It Failed
+
+The Qwen3.6 architecture uses MoE experts heavily in all layers. Unlike dense models where deep layers merely "refine" the output, this MoE model distributes compute evenly — each layer's experts contribute unique information to the residual. The "stagnation" at layers 11-30 is not true convergence; it's a transitional phase before the final refinement wave.
+
+### What Was Learned
+
+- Early exit infrastructure is solid and reusable (graph params, delta detection, graph rebuild)
+- The `n_build_layers` approach is the correct mechanism for dynamic graph sizing
+- Not all models benefit from early exit — architecture matters
+- Future models with different expert distributions may benefit
+
+### Remaining Code
+
+The early exit code remains in the codebase but is disabled by default (`VITRIOL_EARLY_EXIT=0`). To re-enable and debug: set `VITRIOL_EARLY_EXIT=1` with appropriate threshold/stagnation params. The per-layer delta recording in `llama_context::layer_deltas` is always populated when enabled.
