@@ -43,6 +43,7 @@ DEFAULT_SPEC_TYPE=""
 DEFAULT_SPEC_DRAFT_N_MAX=0
 DEFAULT_EXPERT_COUNT=0
 DEFAULT_OUTPUT_CACHE="off"
+DEFAULT_PREDICTIVE_PREFETCH="off"
 
 # ── config vars (set by parse_config) ────────────────────────────
 CFG_DEVICE="$DEFAULT_DEVICE"
@@ -68,6 +69,7 @@ CFG_SPEC_TYPE="$DEFAULT_SPEC_TYPE"
 CFG_SPEC_DRAFT_N_MAX="$DEFAULT_SPEC_DRAFT_N_MAX"
 CFG_EXPERT_COUNT="$DEFAULT_EXPERT_COUNT"
 CFG_OUTPUT_CACHE="$DEFAULT_OUTPUT_CACHE"
+CFG_PREDICTIVE_PREFETCH="$DEFAULT_PREDICTIVE_PREFETCH"
 
 # ═════════════════════════════════════════════════════════════════
 # CONFIG PARSING
@@ -117,6 +119,7 @@ parse_config() {
                 spec.draft_n_max)      CFG_SPEC_DRAFT_N_MAX="$val" ;;
                 model.expert_count)    CFG_EXPERT_COUNT="$val" ;;
                 vitriol.output_cache)  CFG_OUTPUT_CACHE="$val" ;;
+                vitriol.predictive_prefetch) CFG_PREDICTIVE_PREFETCH="$val" ;;
             esac
         fi
     done < "$CONFIG_FILE"
@@ -156,6 +159,8 @@ lru_mb = $CFG_LRU_MB
 verbose = $CFG_VERBOSE
 # Expert output caching: on | off (approximate — reuses previous token's expert outputs)
 output_cache = $CFG_OUTPUT_CACHE
+# Predictive prefetching: on | off (cross-layer + temporal heuristic, DMA stream overlap)
+predictive_prefetch = $CFG_PREDICTIVE_PREFETCH
 
 [server]
 # API host address
@@ -240,6 +245,7 @@ config_show() {
     print_row "Prompt Lookup:         " "${CFG_LOOKUP}"
     print_row "Expert Count:          " "${CFG_EXPERT_COUNT:-0} (0=default)"
     print_row "Output Cache:          " "${CFG_OUTPUT_CACHE}"
+    print_row "Predictive Prefetch:   " "${CFG_PREDICTIVE_PREFETCH}"
     if [[ -n "$CFG_SPEC_TYPE" ]]; then
         local mtp_ok=""
         model_has_mtp "$CFG_MODEL" && mtp_ok=" (MTP detected)"
@@ -286,6 +292,7 @@ config_set() {
         vitriol.lru_mb)        CFG_LRU_MB="$val" ;;
         vitriol.verbose)       CFG_VERBOSE="$val" ;;
         vitriol.output_cache)  CFG_OUTPUT_CACHE="$val" ;;
+        vitriol.predictive_prefetch) CFG_PREDICTIVE_PREFETCH="$val" ;;
         server.host)           CFG_HOST="$val" ;;
         server.parallel)       CFG_PARALLEL="$val" ;;
         server.port)           CFG_PORT="$val" ;;
@@ -554,11 +561,12 @@ tui_vitriol_menu() {
         printf "║  %-37s ║\n" "1) Operation Mode   [${CFG_MODE}]"
         printf "║  %-37s ║\n" "2) LRU Cache (MB)   [${CFG_LRU_MB}] (FP16 only)"
         printf "║  %-37s ║\n" "3) Verbose Logging  [${CFG_VERBOSE}]"
+        printf "║  %-37s ║\n" "4) Predictive Prefetch [${CFG_PREDICTIVE_PREFETCH}]"
         printf "║  %-37s ║\n" "b) Back to Main Menu"
         printf "║  %-37s ║\n" "q) Quit"
         echo "╚══════════════════════════════════════════╝"
         echo ""
-        read -r -p "Select [1-6/b/q]: " choice
+        read -r -p "Select [1-4/b/q]: " choice
         case "$choice" in
             1)
                 echo "Modes: stream (RAM Shot + LRU) | sync | async | off"
@@ -581,6 +589,13 @@ tui_vitriol_menu() {
                     config_set vitriol.verbose "false"
                 else
                     config_set vitriol.verbose "true"
+                fi
+                ;;
+            4)
+                if [[ "$CFG_PREDICTIVE_PREFETCH" == "on" ]]; then
+                    config_set vitriol.predictive_prefetch "off"
+                else
+                    config_set vitriol.predictive_prefetch "on"
                 fi
                 ;;
             5)
@@ -814,6 +829,7 @@ Run options:
   --kv-mode MODE       KV cache: standard | offload | sparse
   --frozen-prompt M    frozen prompt caching: on | off
   --semantic-mode M    semantic search: on | off (requires sentence-transformers)
+  --predictive-prefetch on|off  cross-layer expert prefetch (DMA stream overlap)
   --verbose            enable debug logging
   --dry-run            print config without launching
 
@@ -917,6 +933,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         SPEC_DRAFT_N_MAX="${CLI_SPEC_DRAFT_N_MAX:-${CFG_SPEC_DRAFT_N_MAX}}"
         EXPERT_COUNT="${CFG_EXPERT_COUNT}"
         OUTPUT_CACHE="${CFG_OUTPUT_CACHE}"
+        PREDICTIVE_PREFETCH="${CFG_PREDICTIVE_PREFETCH}"
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -989,6 +1006,8 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
 
         ENV_VERBOSE=""
         [[ "$VERBOSE" == "true" ]] && ENV_VERBOSE="VITRIOL_VERBOSE=1"
+        ENV_PREDICTIVE_PREFETCH=""
+        [[ "$PREDICTIVE_PREFETCH" == "on" ]] && ENV_PREDICTIVE_PREFETCH="VITRIOL_PREDICTIVE_PREFETCH=1"
 
         exec env \
             CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" \
@@ -1007,6 +1026,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
             VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
             $ENV_VERBOSE \
+            $ENV_PREDICTIVE_PREFETCH \
             "$BINARY" \
             -m "$MODEL" \
             -ngl "$NGL" \
@@ -1089,6 +1109,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         SPEC_DRAFT_N_MAX="${CLI_SPEC_DRAFT_N_MAX:-${CFG_SPEC_DRAFT_N_MAX}}"
         EXPERT_COUNT="${CFG_EXPERT_COUNT}"
         OUTPUT_CACHE="${CFG_OUTPUT_CACHE}"
+        PREDICTIVE_PREFETCH="${CFG_PREDICTIVE_PREFETCH}"
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -1158,6 +1179,8 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
 
         ENV_VERBOSE=""
         [[ "$VERBOSE" == "true" ]] && ENV_VERBOSE="VITRIOL_VERBOSE=1"
+        ENV_PREDICTIVE_PREFETCH=""
+        [[ "$PREDICTIVE_PREFETCH" == "on" ]] && ENV_PREDICTIVE_PREFETCH="VITRIOL_PREDICTIVE_PREFETCH=1"
 
         # KV cache quant args (pass to llama-server as --cache-type-k/v)
         KV_CACHE_ARGS=""
@@ -1194,6 +1217,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
+                    $ENV_PREDICTIVE_PREFETCH \
                     nohup "$SERVER_BINARY" \
                         -m "$MODEL" \
                         -ngl "$NGL" \
@@ -1242,6 +1266,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
+                    $ENV_PREDICTIVE_PREFETCH \
                     nohup "$SERVER_BINARY" \
                         -m "$MODEL" \
                         -ngl "$NGL" \
@@ -1290,6 +1315,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
+                    $ENV_PREDICTIVE_PREFETCH \
                     "$SERVER_BINARY" \
                         -m "$MODEL" \
                         -ngl "$NGL" \
@@ -1336,6 +1362,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
+                    $ENV_PREDICTIVE_PREFETCH \
                     "$SERVER_BINARY" \
                     -m "$MODEL" \
                     -ngl "$NGL" \

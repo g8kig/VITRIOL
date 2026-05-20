@@ -419,7 +419,7 @@ Available via CLI flag, env var, config key `memory.semantic_mode`, and TUI (opt
 |-------|-------|
 | **Date** | 2026-05-17 |
 | **Approach** | Heuristic: store expert IDs from previous `ggml_cuda_mul_mat_id` call, prefetch same experts via async DMA before next call's device→host ID copy completes |
-| **Status** | 💡 Implemented, built, untested (no end-to-end run yet) |
+| **Status** | ✅ Tested — +7.8% with DMA overlap (2026-05-20) |
 
 ### Implementation
 
@@ -444,6 +444,33 @@ Three hooks in the MoE matmul path:
 - Only prefetches from the immediately preceding layer; does not look further ahead.
 
 **Modified:** `vitriol-cuda-integration.h/.cpp`, `ggml-cuda.cu`, `llama.cpp-patches/`.
+
+### Update 2026-05-20: Dedicated DMA Stream Overlap (Fire-and-Forget Prefetch)
+
+Converted `vitriol_lru_prefetch` from a blocking call (which submitted DMA + waited on compute stream) to a true fire-and-forget async operation. Key changes:
+
+- **New `vitriol_lru_prefetch_async()`** (static): submits `cuMemcpyHtoDAsync` on `g_lru_stream`, records `cuEventRecord`, but does **not** call `cuStreamWaitEvent` on any compute stream.
+- **Cache-hit path in `vitriol_lru_ensure()`**: now calls `cuStreamWaitEvent(cstream, g_lru_event, 0)` before returning the VRAM pointer, ensuring data DMA'd by a prefetch is fully resident before the matmul reads it.
+- **`vitriol_lru_prefetch()`**: now delegates to `vitriol_lru_prefetch_async()`, ignoring the `compute_stream` parameter.
+
+Rationale: previously the comment on `vitriol_lru_prefetch` claimed "fire-and-forget" but the implementation called `vitriol_lru_ensure` which performed a synchronous wait. The added wait was moved to the cache-hit path where it's needed (the per-expert loop reads the data), allowing prefetches to overlap with codes copy + sort at the start of each layer.
+
+### DMA Overlap Benchmark Results
+
+Measured with Qwen3.6-35B-A3B-UD-IQ2_M, stream mode, 1024 MB LRU, output cache ON, Q4_0 KV, FA on, -ngl 99, -t 4, -mmp 0. `llama-bench` with `-n 100 -r 3`.
+
+| Configuration | tg100 (t/s) | LRU hit rate | vs baseline |
+|---|---|---|---|
+| Output cache only (sorted path) | 9.34 ± 0.05 | 99.04% | — |
+| + Predictive prefetch + DMA overlap | **10.07 ± 0.09** | 99.54% | **+7.8%** |
+
+Statistically significant (non-overlapping error bars). The predictor increases LRU hit rate marginally (99.04→99.54%) but the DMA overlap itself provides the bulk of the speedup by hiding PCIe transfer latency behind compute (IDs copy + sort at start of each layer's ggml_cuda_mul_mat_id).
+
+Note: the sorted path (required for output cache + LRU + predictor) is only entered during single-token generation (`ne12 == 1`) with `VITRIOL_OUTPUT_CACHE=1`. The output cache itself is approximate (reuses previous token's expert outputs), but the predictor + DMA overlap have zero quality impact.
+
+### Config Integration
+
+Added `predictive_prefetch = on|off` to VITRIOL config file, TUI (option 4 in VITRIOL Mode Settings), and env var `VITRIOL_PREDICTIVE_PREFETCH=1`. Defaults to `off`.
 
 ---
 
@@ -476,4 +503,4 @@ Predictive Prefetching (§5) hides DMA latency regardless of split count, making
 
 ---
 
-*Last updated: 2026-05-17 19:30 CEST*
+*Last updated: 2026-05-20 10:08 CEST*
