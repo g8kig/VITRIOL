@@ -897,7 +897,8 @@ usage() {
   vitriol run [options]      interactive inference session
   vitriol serve [options]    persistent HTTP API server
   vitriol stop               stop running server
-  vitriol bench [options]    quick throughput benchmark (uses llama-cli)
+  vitriol bench [options]    quick throughput benchmark (uses llama-bench)
+  vitriol tui                live dashboard (requires textual Python lib)
   vitriol config             interactive configuration TUI
   vitriol config show        print current configuration
   vitriol config init        create config file with defaults
@@ -1690,6 +1691,24 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
             -p 64 \
             -n "$N" \
             -t 4 2>&1
+        ;;
+
+    tui)
+        TUI_SCRIPT="${LLAMA_DIR}/../libvitriol/vitriol-tui.py"
+        if [[ ! -f "$TUI_SCRIPT" ]]; then
+            echo "ERROR: TUI script not found at $TUI_SCRIPT"
+            exit 1
+        fi
+        # Check if textual is installed
+        python3 -c "import textual" 2>/dev/null || {
+            echo "ERROR: Textual Python library not installed"
+            echo "  Install with: pip install --user textual"
+            exit 1
+        }
+        echo "Starting VITRIOL TUI Dashboard..."
+        echo "  (Run 'vitriol serve --detach' first to have stats)"
+        echo ""
+        python3 "$TUI_SCRIPT" "${@}"
         ;;
 
     config)
