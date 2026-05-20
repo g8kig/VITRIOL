@@ -871,6 +871,7 @@ usage() {
   vitriol run [options]      interactive inference session
   vitriol serve [options]    persistent HTTP API server
   vitriol stop               stop running server
+  vitriol bench [options]    quick throughput benchmark (uses llama-cli)
   vitriol config             interactive configuration TUI
   vitriol config show        print current configuration
   vitriol config init        create config file with defaults
@@ -1530,6 +1531,117 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         fi
         ;;
 
+    bench)
+        shift
+        # Run a quick benchmark using llama-bench
+        CLI_MODEL=""
+        CLI_CTX=""
+        CLI_NGL=""
+        CLI_LRU_MB=""
+        CLI_VERBOSE=""
+        CLI_PIN_LAYERS=""
+        CLI_PRUNE_EXPERTS=""
+        CLI_N=100
+        DRY_RUN=false
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -m) CLI_MODEL="$2"; shift 2 ;;
+                -c) CLI_CTX="$2"; shift 2 ;;
+                -ngl) CLI_NGL="$2"; shift 2 ;;
+                -lru) CLI_LRU_MB="$2"; shift 2 ;;
+                -n) CLI_N="$2"; shift 2 ;;
+                --pin-layers) CLI_PIN_LAYERS="$2"; shift 2 ;;
+                --prune-experts) CLI_PRUNE_EXPERTS="$2"; shift 2 ;;
+                --verbose) CLI_VERBOSE="true"; shift ;;
+                --dry-run) DRY_RUN=true; shift ;;
+                -h|--help) usage; exit 0 ;;
+                *) echo "Unknown: $1"; usage; exit 1 ;;
+            esac
+        done
+
+        MODEL="${VITRIOL_MODEL:-${CLI_MODEL:-${CFG_MODEL}}}"
+        CTX="${CLI_CTX:-${CFG_CTX}}"
+        NGL="${CLI_NGL:-${CFG_NGL}}"
+        LRU_MB="${CLI_LRU_MB:-${CFG_LRU_MB}}"
+        MODE="${VITRIOL_MODE:-${CFG_MODE}}"
+        OUTPUT_CACHE="${CFG_OUTPUT_CACHE}"
+        PREDICTIVE_PREFETCH="${CFG_PREDICTIVE_PREFETCH}"
+        PIN_FIRST_N_LAYERS="${CLI_PIN_LAYERS:-${CFG_PIN_FIRST_N_LAYERS}}"
+        PRUNE_EXPERTS="${CLI_PRUNE_EXPERTS:-${CFG_PRUNE_EXPERTS}}"
+        VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
+        DEVICE="${CFG_DEVICE}"
+
+        N="${CLI_N}"
+
+        if [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && [[ "$OUTPUT_CACHE" == "on" ]]; then
+            OUTPUT_CACHE="off"
+        fi
+
+        if [[ "$CFG_EXCLUDE_SECONDARY" == "true" ]]; then
+            CUDA_DEVICES="${DEVICE}"
+        else
+            CUDA_DEVICES="0,1"
+        fi
+
+        BENCH_BINARY="${LLAMA_DIR}/build/bin/llama-bench"
+
+        if [[ ! -f "$MODEL" ]]; then
+            echo "ERROR: model not found: $MODEL"; exit 1
+        fi
+        if [[ ! -x "$BENCH_BINARY" ]]; then
+            echo "ERROR: llama-bench not found at $BENCH_BINARY"; exit 1
+        fi
+
+        MODEL_SIZE=$(stat --format=%s "$MODEL" 2>/dev/null | numfmt --to=iec || echo "?")
+
+        echo "═══ VITRIOL Bench ═══"
+        echo "  Model:    $(basename "$MODEL") ($MODEL_SIZE)"
+        echo "  Gen:      $N tokens"
+        echo "  GPU:      Device $DEVICE"
+        echo "  Mode:     $MODE"
+        [[ "$OUTPUT_CACHE" == "on" ]] && echo "  Cache:    output cache"
+        [[ "$PREDICTIVE_PREFETCH" == "on" ]] && echo "  Prefetch: predictive"
+        [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && echo "  Pin:      $PIN_FIRST_N_LAYERS layers"
+        [[ "${PRUNE_EXPERTS:-0}" -gt 0 ]] && echo "  Prune:    $PRUNE_EXPERTS experts"
+        [[ "${NGL}" -gt 0 ]] && echo "  NGL:      $NGL"
+        echo "══════════════════════"
+        echo ""
+
+        if $DRY_RUN; then
+            exit 0
+        fi
+
+        ENV_VERBOSE=""
+        [[ "$VERBOSE" == "true" ]] && ENV_VERBOSE="VITRIOL_VERBOSE=1"
+        ENV_PREDICTIVE_PREFETCH=""
+        [[ "$PREDICTIVE_PREFETCH" == "on" ]] && ENV_PREDICTIVE_PREFETCH="VITRIOL_PREDICTIVE_PREFETCH=1"
+
+        echo "NOTE: Run 'vitriol setup' first for CAP_IPC_LOCK on llama-bench"
+        echo ""
+
+        env \
+            CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" \
+            VITRIOL_MODE="$MODE" \
+            VITRIOL_LRU_MB="$LRU_MB" \
+            VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
+            VITRIOL_PIN_FIRST_N_LAYERS="$PIN_FIRST_N_LAYERS" \
+            VITRIOL_PRUNE_EXPERTS="$PRUNE_EXPERTS" \
+            VITRIOL_PREDICTIVE_PREFETCH="$PREDICTIVE_PREFETCH" \
+            LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
+            $ENV_VERBOSE \
+            "$BENCH_BINARY" \
+            -m "$MODEL" \
+            -ngl "$NGL" \
+            -c "${CTX}" \
+            -p 64 \
+            -n "$N" \
+            -t 4 2>&1 
+
+    bench)
+        # parsed above in the bench section
+        ;;
+
     config)
         shift
         case "${1:-}" in
@@ -1546,6 +1658,11 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         setup_caps "$BINARY"
         if [[ -x "$SERVER_BINARY" ]]; then
             setup_caps "$SERVER_BINARY"
+        fi
+        # Also set caps on llama-bench if it exists
+        BENCH_BINARY="${LLAMA_DIR}/build/bin/llama-bench"
+        if [[ -x "$BENCH_BINARY" ]]; then
+            setup_caps "$BENCH_BINARY"
         fi
         ;;
 
