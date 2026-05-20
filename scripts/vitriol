@@ -360,7 +360,11 @@ model_has_mtp() {
 # ═════════════════════════════════════════════════════════════════
 
 print_header() {
-    if [[ -f "$HEADER_FILE" ]]; then
+    local logo_file="${SCRIPT_DIR}/../assets/ansi-logo.txt"
+    if [[ -f "$logo_file" ]]; then
+        # ANSI logo with green/gold VITRIOL art
+        echo -e "$(grep -v '^#' "$logo_file" | head -1 | sed "s/echo -e '//" | sed "s/'$//")"
+    elif [[ -f "$HEADER_FILE" ]]; then
         cat "$HEADER_FILE"
     else
         echo "VITRIOL — MoE Expert Offloading"

@@ -468,23 +468,87 @@ class DashboardScreen(Screen):
                 pass
             return
         try:
-            self.query_one("#status-msg", Static).update("Starting server...")
+            self.query_one("#status-msg", Static).update("Starting server ███░░░")
         except NoMatches:
             pass
         self._do_launch()
 
     @work(thread=True)
     def _do_launch(self):
+        import pathlib
+        # Clear old log so we can track fresh progress
+        log_path = pathlib.Path(LOG_PATH)
+        log_path.write_text("")
+        previous_size = 0
+
+        # Start server in background
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 ["bash", str(SCRIPT_PATH), "serve", "--detach"],
-                capture_output=True, text=True, timeout=300
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            success = result.returncode == 0
-            self.app.call_from_thread(self._launch_result, success,
-                                  result.stderr.strip() or result.stdout.strip())
         except Exception as e:
             self.app.call_from_thread(self._launch_result, False, str(e))
+            return
+
+        # Monitor log for progress with animated status
+        start_time = time.time()
+        progress_steps = [
+            ("loading model", "🧠 Loading model"),
+            ("offload", "📦 Offloading layers to GPU"),
+            ("load_tensors", "📥 Loading tensors"),
+            ("pinning", "📌 Pinning experts to VRAM"),
+            ("server is listening", "✅ Server ready",
+             lambda: self.app.call_from_thread(self._launch_result, True)),
+        ]
+        step_idx = 0
+        server_pid_file = pathlib.Path(PID_PATH)
+
+        while time.time() - start_time < 180:
+            time.sleep(2)
+
+            # Check if PID file appeared
+            if server_pid_file.exists():
+                self.app.call_from_thread(self._update_status_msg, "⌛ Waiting for model load...")
+
+            # Read new log lines for progress
+            try:
+                current_size = log_path.stat().st_size if log_path.exists() else 0
+                if current_size > previous_size:
+                    with open(log_path, errors="replace") as f:
+                        f.seek(previous_size)
+                        new_text = f.read()
+                        previous_size = f.tell()
+
+                    # Check each progress step
+                    for keyword, msg, *callback in progress_steps[step_idx:]:
+                        if keyword.lower() in new_text.lower():
+                            step_idx += 1
+                            self.app.call_from_thread(self._update_status_msg, msg)
+                            if callback:
+                                callback[0]()
+                            break
+            except (IOError, PermissionError):
+                pass
+
+            # Check if server process died
+            if proc.poll() is not None and not server_pid_file.exists():
+                self.app.call_from_thread(self._launch_result, False,
+                                          "Server exited early — check config")
+                return
+
+            # Animate the status
+            dots = "." * (int(time.time() * 2) % 4)
+            self.app.call_from_thread(self._update_status_msg, f"Loading{dots}")
+
+        # Timeout
+        self.app.call_from_thread(self._launch_result, False, "Timeout (180s)")
+
+    def _update_status_msg(self, msg: str):
+        try:
+            self.query_one("#status-msg", Static).update(msg)
+        except NoMatches:
+            pass
 
     def _launch_result(self, success: bool, msg: str = ""):
         try:
@@ -521,26 +585,42 @@ class VitriolTUI(App):
 
     TITLE = "VITRIOL Dashboard"
     SUB_TITLE = "Live inference monitor"
+
+    # VITRIOL custom theme — emerald green + gold
     CSS = """
+    $primary: #D79A44;
+    $secondary: #41985E;
+    $success: #41985E;
+    $warning: #D79A44;
+    $error: #cc3333;
+    $surface: #1a1a1a;
+    $panel: #111111;
+
     Screen {
         layout: vertical;
+        background: #000000;
     }
     .section-title {
         text-style: bold;
-        color: $primary;
+        color: #D79A44;
         padding: 0 1;
     }
     .section-header {
         text-style: underline;
-        color: $secondary;
+        color: #41985E;
         padding: 1 1 0 1;
     }
     .field-label {
         padding: 0 1;
-        color: $text-muted;
+        color: #888888;
     }
     .field-input {
         margin: 0 1;
+        background: #111111;
+        color: #dddddd;
+    }
+    .field-input:focus {
+        border: solid #D79A44;
     }
     .button-row {
         height: auto;
@@ -557,26 +637,72 @@ class VitriolTUI(App):
         padding: 0;
     }
     #status-msg {
-        color: $success;
+        color: #41985E;
         padding: 0 1;
+    }
+    Button {
+        background: #1a1a1a;
+        color: #dddddd;
+        border: solid #D79A44;
+    }
+    Button:hover {
+        background: #D79A44;
+        color: #000000;
+    }
+    Button:focus {
+        border: solid #41985E;
+    }
+    .button-row Button {
+        margin: 0 1;
     }
     #stat-tps, #stat-ptps, #stat-mtp, #stat-vram, #stat-server {
         padding: 0 1;
+        color: #dddddd;
     }
     #bottleneck {
-        border: solid $secondary;
+        border: solid #41985E;
         margin: 0 1;
+        color: #aaaaaa;
     }
     #log {
-        border: solid $surface;
+        border: solid #333333;
         margin: 0 1;
         height: 1fr;
-    }
-    Button {
-        margin: 0 1;
+        background: #0a0a0a;
+        color: #cccccc;
     }
     TabbedContent {
         height: 1fr;
+    }
+    TabbedContent > TabPane {
+        background: #000000;
+    }
+    TabbedContent > TabLabel {
+        background: #1a1a1a;
+        color: #888888;
+    }
+    TabbedContent > TabLabel:focus {
+        background: #D79A44;
+        color: #000000;
+    }
+    Tab {
+        background: #1a1a1a;
+        color: #888888;
+    }
+    Tab:focus {
+        background: #D79A44;
+        color: #000000;
+    }
+    Header {
+        background: #111111;
+        color: #D79A44;
+    }
+    Footer {
+        background: #111111;
+        color: #888888;
+    }
+    LoadingIndicator {
+        color: #41985E;
     }
     """
 
