@@ -380,7 +380,7 @@ class DashboardScreen(Screen):
         self.watcher = ServerLogWatcher()
         self.poll_loop()
 
-    @work(thread=True, exit_if_already_running=True)
+    @work(thread=True)
     def poll_loop(self):
         while True:
             self.call_from_thread(self._update)
