@@ -44,6 +44,7 @@ DEFAULT_SPEC_DRAFT_N_MAX=0
 DEFAULT_EXPERT_COUNT=0
 DEFAULT_OUTPUT_CACHE="off"
 DEFAULT_PREDICTIVE_PREFETCH="off"
+DEFAULT_PIN_FIRST_N_LAYERS=0
 
 # ── config vars (set by parse_config) ────────────────────────────
 CFG_DEVICE="$DEFAULT_DEVICE"
@@ -70,6 +71,7 @@ CFG_SPEC_DRAFT_N_MAX="$DEFAULT_SPEC_DRAFT_N_MAX"
 CFG_EXPERT_COUNT="$DEFAULT_EXPERT_COUNT"
 CFG_OUTPUT_CACHE="$DEFAULT_OUTPUT_CACHE"
 CFG_PREDICTIVE_PREFETCH="$DEFAULT_PREDICTIVE_PREFETCH"
+CFG_PIN_FIRST_N_LAYERS="$DEFAULT_PIN_FIRST_N_LAYERS"
 
 # ═════════════════════════════════════════════════════════════════
 # CONFIG PARSING
@@ -119,7 +121,8 @@ parse_config() {
                 spec.draft_n_max)      CFG_SPEC_DRAFT_N_MAX="$val" ;;
                 model.expert_count)    CFG_EXPERT_COUNT="$val" ;;
                 vitriol.output_cache)  CFG_OUTPUT_CACHE="$val" ;;
-                vitriol.predictive_prefetch) CFG_PREDICTIVE_PREFETCH="$val" ;;
+                 vitriol.predictive_prefetch) CFG_PREDICTIVE_PREFETCH="$val" ;;
+                 vitriol.pin_first_n_layers) CFG_PIN_FIRST_N_LAYERS="$val" ;;
             esac
         fi
     done < "$CONFIG_FILE"
@@ -161,6 +164,11 @@ verbose = $CFG_VERBOSE
 output_cache = $CFG_OUTPUT_CACHE
 # Predictive prefetching: on | off (cross-layer + temporal heuristic, DMA stream overlap)
 predictive_prefetch = $CFG_PREDICTIVE_PREFETCH
+# Expert pinning: pin first N layers' expert tensors in VRAM (0 = off)
+#   Pins all 256 experts per pinned layer into VRAM at first use.
+#   Targets the fast MMVQ/MMQ/MMF kernel path — auto-disables output cache.
+#   Recommended: 5-15. Uses ~220 MB per layer. Needs KV offload for >10.
+pin_first_n_layers = $CFG_PIN_FIRST_N_LAYERS
 
 [server]
 # API host address
@@ -246,6 +254,7 @@ config_show() {
     print_row "Expert Count:          " "${CFG_EXPERT_COUNT:-0} (0=default)"
     print_row "Output Cache:          " "${CFG_OUTPUT_CACHE}"
     print_row "Predictive Prefetch:   " "${CFG_PREDICTIVE_PREFETCH}"
+    print_row "Expert Pin Layers:     " "${CFG_PIN_FIRST_N_LAYERS:-0} (0=off)"
     if [[ -n "$CFG_SPEC_TYPE" ]]; then
         local mtp_ok=""
         model_has_mtp "$CFG_MODEL" && mtp_ok=" (MTP detected)"
@@ -264,6 +273,7 @@ config_show() {
 config_reset() {
     CFG_DEVICE="$DEFAULT_DEVICE"
     CFG_EXCLUDE_SECONDARY="$DEFAULT_EXCLUDE_SECONDARY"
+    CFG_PIN_FIRST_N_LAYERS="$DEFAULT_PIN_FIRST_N_LAYERS"
     CFG_MODEL="$DEFAULT_MODEL"
     CFG_CTX="$DEFAULT_CTX"
     CFG_THREADS="$DEFAULT_THREADS"
@@ -293,6 +303,7 @@ config_set() {
         vitriol.verbose)       CFG_VERBOSE="$val" ;;
         vitriol.output_cache)  CFG_OUTPUT_CACHE="$val" ;;
         vitriol.predictive_prefetch) CFG_PREDICTIVE_PREFETCH="$val" ;;
+        vitriol.pin_first_n_layers) CFG_PIN_FIRST_N_LAYERS="$val" ;;
         server.host)           CFG_HOST="$val" ;;
         server.parallel)       CFG_PARALLEL="$val" ;;
         server.port)           CFG_PORT="$val" ;;
@@ -562,11 +573,12 @@ tui_vitriol_menu() {
         printf "║  %-37s ║\n" "2) LRU Cache (MB)   [${CFG_LRU_MB}] (FP16 only)"
         printf "║  %-37s ║\n" "3) Verbose Logging  [${CFG_VERBOSE}]"
         printf "║  %-37s ║\n" "4) Predictive Prefetch [${CFG_PREDICTIVE_PREFETCH}]"
+        printf "║  %-37s ║\n" "5) Expert Pin Layers  [${CFG_PIN_FIRST_N_LAYERS}]"
         printf "║  %-37s ║\n" "b) Back to Main Menu"
         printf "║  %-37s ║\n" "q) Quit"
         echo "╚══════════════════════════════════════════╝"
         echo ""
-        read -r -p "Select [1-4/b/q]: " choice
+        read -r -p "Select [1-5/b/q]: " choice
         case "$choice" in
             1)
                 echo "Modes: stream (RAM Shot + LRU) | sync | async | off"
@@ -599,20 +611,30 @@ tui_vitriol_menu() {
                 fi
                 ;;
             5)
-                echo "Options: f16 (FP16, default) | q8_0 (8-bit) | q4_0 (4-bit, max compression)"
-                read -r -p "Enter mode: " val
-                case "$val" in
-                    f16|q8_0|q4_0) config_set kv.quant_mode "$val" ;;
-                    *) echo "Invalid mode"; sleep 1 ;;
-                esac
-                ;;
-            6)
-                echo "Number of tokens to look ahead (0=disabled, 8-32 recommended)"
-                read -r -p "Enter tokens: " val
-                if [[ "$val" =~ ^[0-9]+$ ]] && ((val >= 0 && val <= 128)); then
-                    config_set lookup_tokens "$val"
+                echo ""
+                echo "Expert Pinning: permanently pins the full expert weight tensors"
+                echo "of the first N layers into VRAM. Targets the fast MMVQ/MMQ/MMF path."
+                echo ""
+                echo "  Recommended: 5-15 layers (~220 MB per layer)"
+                echo "  Auto-disables output cache (pinning + output cache target"
+                echo "  different decode paths and do not stack)"
+                echo ""
+                echo "NOTE: Requires --kv-mode offload for >10 layers."
+                echo "Not recommended with output cache enabled."
+                echo ""
+                read -r -p "Enter number of layers to pin (0=off, 1-40): " val
+                if [[ "$val" =~ ^[0-9]+$ ]] && ((val >= 0 && val <= 40)); then
+                    config_set vitriol.pin_first_n_layers "$val"
+                    if [[ "$val" -gt 0 ]]; then
+                        echo ""
+                        echo "  → Output cache has been disabled (pinning + output cache"
+                        echo "    target different decode paths). You can re-enable it"
+                        echo "    manually in Model Settings (option 6), but pinning will"
+                        echo "    then only help during prefill, not decode."
+                        config_set vitriol.output_cache "off"
+                    fi
                 else
-                    echo "Invalid (must be 0-128)"; sleep 1
+                    echo "Invalid (must be 0-40)"; sleep 1
                 fi
                 ;;
             b|B) return ;;
@@ -830,6 +852,7 @@ Run options:
   --frozen-prompt M    frozen prompt caching: on | off
   --semantic-mode M    semantic search: on | off (requires sentence-transformers)
   --predictive-prefetch on|off  cross-layer expert prefetch (DMA stream overlap)
+  --pin-layers N       pin first N layers' expert tensors in VRAM
   --verbose            enable debug logging
   --dry-run            print config without launching
 
@@ -849,6 +872,7 @@ Serve options:
   --detach             run server in background
   --spec-type TYPE     speculative decoding type (mtp, draft, etc.)
   --spec-draft-n-max N number of tokens to draft (e.g. 2 for MTP)
+  --pin-layers N       pin first N layers' expert tensors in VRAM
   --verbose          enable debug logging
   --dry-run          print config without launching
 
@@ -884,34 +908,36 @@ case "$CMD" in
         CLI_LOOKUP=""
         CLI_ENGINE_MODE=""
         CLI_DISK_OFFLOAD=""
-        CLI_SPEC_TYPE=""
-        CLI_SPEC_DRAFT_N_MAX=""
-        DRY_RUN=false
+            CLI_SPEC_TYPE=""
+            CLI_SPEC_DRAFT_N_MAX=""
+            CLI_PIN_LAYERS=""
+            DRY_RUN=false
 
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                -m) CLI_MODEL="$2"; shift 2 ;;
-                -c) CLI_CTX="$2"; shift 2 ;;
-                -t) CLI_THREADS="$2"; shift 2 ;;
-                -ngl) CLI_NGL="$2"; shift 2 ;;
-                -lru) CLI_LRU_MB="$2"; shift 2 ;;
-                -port) CLI_PORT="$2"; shift 2 ;;
-                --memory-mode) CLI_MEMORY_MODE="$2"; shift 2 ;;
-                --kv-mode) CLI_KV_MODE="$2"; shift 2 ;;
-                --frozen-prompt) CLI_FROZEN_PROMPT="$2"; shift 2 ;;
-                --semantic-mode) CLI_SEMANTIC_MODE="$2"; shift 2 ;;
-                --kv-quant) CLI_KV_QUANT="$2"; shift 2 ;;
-                --lookup) CLI_LOOKUP="$2"; shift 2 ;;
-                --engine-mode) CLI_ENGINE_MODE="$2"; shift 2 ;;
-                --spec-type) CLI_SPEC_TYPE="$2"; shift 2 ;;
-                --spec-draft-n-max) CLI_SPEC_DRAFT_N_MAX="$2"; shift 2 ;;
-                --verbose) CLI_VERBOSE="true"; shift ;;
-                --disk-offload) CLI_DISK_OFFLOAD="1"; shift ;;
-                --dry-run) DRY_RUN=true; shift ;;
-                -h|--help) usage; exit 0 ;;
-                *) echo "Unknown: $1"; usage; exit 1 ;;
-            esac
-        done
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    -m) CLI_MODEL="$2"; shift 2 ;;
+                    -c) CLI_CTX="$2"; shift 2 ;;
+                    -t) CLI_THREADS="$2"; shift 2 ;;
+                    -ngl) CLI_NGL="$2"; shift 2 ;;
+                    -lru) CLI_LRU_MB="$2"; shift 2 ;;
+                    -port) CLI_PORT="$2"; shift 2 ;;
+                    --memory-mode) CLI_MEMORY_MODE="$2"; shift 2 ;;
+                    --kv-mode) CLI_KV_MODE="$2"; shift 2 ;;
+                    --frozen-prompt) CLI_FROZEN_PROMPT="$2"; shift 2 ;;
+                    --semantic-mode) CLI_SEMANTIC_MODE="$2"; shift 2 ;;
+                    --kv-quant) CLI_KV_QUANT="$2"; shift 2 ;;
+                    --lookup) CLI_LOOKUP="$2"; shift 2 ;;
+                    --engine-mode) CLI_ENGINE_MODE="$2"; shift 2 ;;
+                    --spec-type) CLI_SPEC_TYPE="$2"; shift 2 ;;
+                    --spec-draft-n-max) CLI_SPEC_DRAFT_N_MAX="$2"; shift 2 ;;
+                    --verbose) CLI_VERBOSE="true"; shift ;;
+                    --disk-offload) CLI_DISK_OFFLOAD="1"; shift ;;
+                    --pin-layers) CLI_PIN_LAYERS="$2"; shift 2 ;;
+                    --dry-run) DRY_RUN=true; shift;;
+                    -h|--help) usage; exit 0 ;;
+                    *) echo "Unknown: $1"; usage; exit 1 ;;
+                esac
+            done
 
         # Precedence: CLI > Config > Env > Default
         MODEL="${VITRIOL_MODEL:-${CLI_MODEL:-${CFG_MODEL}}}"
@@ -934,6 +960,12 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         EXPERT_COUNT="${CFG_EXPERT_COUNT}"
         OUTPUT_CACHE="${CFG_OUTPUT_CACHE}"
         PREDICTIVE_PREFETCH="${CFG_PREDICTIVE_PREFETCH}"
+        PIN_FIRST_N_LAYERS="${CLI_PIN_LAYERS:-${CFG_PIN_FIRST_N_LAYERS}}"
+        # Auto-disable output cache when pinning is active
+        if [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && [[ "$OUTPUT_CACHE" == "on" ]]; then
+            OUTPUT_CACHE="off"
+            echo "  → Output cache auto-disabled (pinning + output cache target different decode paths)"
+        fi
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -990,6 +1022,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         echo "  Engine:      $ENGINE_MODE"
         [[ -n "$SPEC_TYPE" ]] && echo "  Spec Type:   $SPEC_TYPE"
         [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && echo "  Draft N-Max: $SPEC_DRAFT_N_MAX"
+        [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && echo "  Pin Layers:  $PIN_FIRST_N_LAYERS (expert tensors in VRAM)"
         echo "  Binary:      $BINARY"
         echo "  Port:        $PORT"
         [[ "$VERBOSE" == "true" ]] && echo "  Logging:     verbose"
@@ -1023,6 +1056,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
             VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
             VITRIOL_EXPERT_COUNT="$EXPERT_COUNT" \
             VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
+            VITRIOL_PIN_FIRST_N_LAYERS="$PIN_FIRST_N_LAYERS" \
             VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
             $ENV_VERBOSE \
@@ -1057,6 +1091,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         CLI_DISK_OFFLOAD=""
         CLI_SPEC_TYPE=""
         CLI_SPEC_DRAFT_N_MAX=""
+        CLI_PIN_LAYERS=""
         DETACH=false
         DRY_RUN=false
 
@@ -1080,9 +1115,10 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                 --spec-type) CLI_SPEC_TYPE="$2"; shift 2 ;;
                 --spec-draft-n-max) CLI_SPEC_DRAFT_N_MAX="$2"; shift 2 ;;
                 --disk-offload) CLI_DISK_OFFLOAD="1"; shift ;;
+                --pin-layers) CLI_PIN_LAYERS="$2"; shift 2 ;;
                 --detach) DETACH=true; shift ;;
                 --verbose) CLI_VERBOSE="true"; shift ;;
-                --dry-run) DRY_RUN=true; shift ;;
+                --dry-run) DRY_RUN=true; shift;;
                 -h|--help) usage; exit 0 ;;
                 *) echo "Unknown: $1"; usage; exit 1 ;;
             esac
@@ -1110,6 +1146,12 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         EXPERT_COUNT="${CFG_EXPERT_COUNT}"
         OUTPUT_CACHE="${CFG_OUTPUT_CACHE}"
         PREDICTIVE_PREFETCH="${CFG_PREDICTIVE_PREFETCH}"
+        PIN_FIRST_N_LAYERS="${CLI_PIN_LAYERS:-${CFG_PIN_FIRST_N_LAYERS}}"
+        # Auto-disable output cache when pinning is active
+        if [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && [[ "$OUTPUT_CACHE" == "on" ]]; then
+            OUTPUT_CACHE="off"
+            echo "  → Output cache auto-disabled (pinning + output cache target different decode paths)"
+        fi
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -1161,6 +1203,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         echo "  Engine:      $ENGINE_MODE"
         [[ -n "$SPEC_TYPE" ]] && echo "  Spec Type:   $SPEC_TYPE"
         [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && echo "  Draft N-Max: $SPEC_DRAFT_N_MAX"
+        [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && echo "  Pin Layers:  $PIN_FIRST_N_LAYERS (expert tensors in VRAM)"
         if [[ "$MEMORY_MODE" == "on" ]]; then
             LLAMA_PORT=$((PORT - 1))
             echo "  Server:      http://${HOST}:${LLAMA_PORT} (llama-server, internal)"
@@ -1214,6 +1257,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                     VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
                     VITRIOL_EXPERT_COUNT="$EXPERT_COUNT" \
                     VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
+                    VITRIOL_PIN_FIRST_N_LAYERS="$PIN_FIRST_N_LAYERS" \
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
@@ -1263,6 +1307,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                     VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
                     VITRIOL_EXPERT_COUNT="$EXPERT_COUNT" \
                     VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
+                    VITRIOL_PIN_FIRST_N_LAYERS="$PIN_FIRST_N_LAYERS" \
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
@@ -1312,6 +1357,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                     VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
                     VITRIOL_EXPERT_COUNT="$EXPERT_COUNT" \
                     VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
+                    VITRIOL_PIN_FIRST_N_LAYERS="$PIN_FIRST_N_LAYERS" \
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \
@@ -1359,6 +1405,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                     VITRIOL_DISK_OFFLOAD="$DISK_OFFLOAD" \
                     VITRIOL_EXPERT_COUNT="$EXPERT_COUNT" \
                     VITRIOL_OUTPUT_CACHE="$OUTPUT_CACHE" \
+                    VITRIOL_PIN_FIRST_N_LAYERS="$PIN_FIRST_N_LAYERS" \
                     VITRIOL_MODEL_PATH="$MODEL" \
                     LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin" \
                     $ENV_VERBOSE \

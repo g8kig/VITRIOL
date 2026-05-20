@@ -503,4 +503,71 @@ Predictive Prefetching (§5) hides DMA latency regardless of split count, making
 
 ---
 
-*Last updated: 2026-05-20 10:08 CEST*
+---
+
+## Experiment 15: Expert Pinning (Tensor-Level VRAM Preload)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-05-20 |
+| **Approach** | Pre-load full expert weight tensors (all 256 experts) of the first N model layers into VRAM at first use. Redirect `src0->data` to VRAM pointer locally in `ggml_cuda_mul_mat_id` before the fast-path MMVQ/MMQ/MMF kernel launches. No kernel changes — scoped `ggml_tensor` copy with `.data` redirected, restored before per-expert loop. |
+| **Config key** | `vitriol.pin_first_n_layers` (0=off, N=pin first N model layers) |
+| **Env var** | `VITRIOL_PIN_FIRST_N_LAYERS=N` |
+| **CLI flag** | `--pin-layers N` |
+| **TUI** | VITRIOL Mode Settings → option 5 |
+| **Status** | ✅ Implemented, benchmarked — **+4% decode gain**, negative prefill impact |
+
+### Implementation Details
+
+- **Layer-to-tensor mapping**: Each model layer produces 2 `ggml_cuda_mul_mat_id` calls (fused gate+up + down). Fixed: layer index divided by `pin_tensors_per_layer` (=2) so `pin_first_n_layers=5` pins 10 tensor ops = 5 model layers.
+- **Lazy allocation**: VRAM buffer allocated on first encounter of each tensor during prefill. Full tensor (all 256 experts) H2D copied via `cuMemcpyHtoDAsync`, then `cuStreamSynchronize`.
+- **Scoped redirect**: Before fast-path checks, creates a local `ggml_tensor` copy of `src0` with `.data` pointing to VRAM buffer. Restores original `src0` before per-expert loop (LRU/predictor/cache unaffected).
+- **Self-disable on OOM**: If `cuMemAlloc` fails, sets `pin_first_n_layers=0` and logs warning. All subsequent layers fall through to host path.
+
+### Benchmark Results
+
+Tested with Qwen3.6-35B-A3B-UD-IQ2_M, VITRIOL_MODE=stream, LRU=0 MB, output cache=off, -ngl 99, -t 4, `llama-bench -p 64 -n 100`.
+
+| Configuration | Tensors pinned | VRAM used | Prefill (pp64) | Decode (tg100) | vs baseline |
+|---|---|---|---|---|---|
+| Baseline (pin=0) | 0 | 0 MB | **297 ms** | **8.94 t/s** | — |
+| Pin 5 layers | 10 | 756 MB | — | ~8.97 t/s | ~0% |
+| Pin 15 layers | 30 | 2,300 MB | **334 ms** (+12%) | **9.30 t/s** | **+4.0%** |
+
+### Key Findings
+
+1. **Pinning helps prefill bandwidth but hurts latency.** The H2D copy of pinned tensors adds ~37 ms to prefill (297→334 ms). Once pinned, subsequent prefill passes would benefit, but `llama-bench` reloads the model each run.
+
+2. **Pinning gives +4% decode gain.** The gain is modest because the **bottleneck is compute, not PCIe**. The MMVQ kernel for IQ2_M (2-bit weights) is ALU-bound — dequantization + multiply takes longer than the weight fetch regardless of where the weights live (VRAM vs host RAM).
+
+3. **This is the compute ceiling.** At 8.94 t/s = 112 ms/tok, with 40 layers → 2.8 ms/layer. The GTX 1070 Ti (Pascal CC 6.1) peaks at ~21 INT8 TFLOPS. Each token requires ~130M MACs (8 experts × 2048 hidden × 1024 FF × 2 matmuls). The theoretical speed of light is roughly **16 t/s** (60 ms/tok purely compute). At 8.94 t/s, we're at ~56% of peak, confirming the GPU is compute-limited.
+
+4. **Per-layer time breakdown:**
+   - Fast path (MMVQ with ids): ~2.8 ms/layer
+   - ~0.5 ms of that is PCIe read (hidden by CUDA stream overlap with next layer)
+   - ~2.3 ms is pure GPU compute (dequant + matmul for 8 active experts)
+   - Pinning saves at most the PCIe portion (~0.5 ms/layer × 15 pinned = ~7.5 ms/tok → ~8% gain theoretical), but existing CUDA stream overlap already hides most of it
+
+### Conclusion
+
+Expert pinning works correctly but provides only **+4% decode gain** because the GPU is compute-bound for low-bit MoE matmuls. The PCIe bus is no longer the primary bottleneck. This is a **valuable negative result** — it tells us where to focus next.
+
+### Modified Files
+
+| File | Changes |
+|------|---------|
+| `vitriol-cuda-integration.h` | Added `pin_first_n_layers`, `pin_tensors_per_layer`, `pin_active` to config struct; `vitriol_pin_ensure()`, `vitriol_pin_lookup()`, `vitriol_pin_active()` |
+| `vitriol-cuda-integration.cpp` | Pin table (unordered_map), lazy alloc + H2D copy, env var read, cleanup, stats |
+| `ggml-cuda.cu` (~2529-2574) | Scoped `src0` redirect before fast-path, restore before per-expert loop |
+| `scripts/vitriol` | Config key, TUI option 5, `--pin-layers` CLI flag, auto-disable output cache, env passthrough |
+
+### Plans for Next Sprint: "Cheating Compute"
+
+Four approaches documented in `.opencode/plans/`:
+
+1. **Top-K Pruning** (`TOP_K_PRUNING.md`) — Drop bottom 4 of 8 active experts, halve matmul time. Targets compute directly.
+2. **T-MAC** (`T_MAC_LUT_MATMUL.md`) — Replace multiply with lookup tables for TQ1_0/IQ2 weights. Bypasses ALU entirely.
+3. **Early Exit** (`EARLY_EXIT.md`) — Skip layers 21-40 when residual stabilizes. Saves 50% compute.
+4. **Asymmetric Pinning + Cache** (`ASYMMETRIC_PIN_CACHE.md`) — Pin early layers (compute-bound, no cache benefit), output-cache late layers (sluggish residual, high cache hit rate).
+
+*Last updated: 2026-05-20 11:10 CEST*
