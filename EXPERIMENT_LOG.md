@@ -572,69 +572,59 @@ Four approaches documented in `.opencode/plans/`:
 
 ---
 
-## Experiment 15: Expert Pinning + Top-K Pruning
+## Experiment 16: Quality Regression Discovery (2026-05-20)
 
-| Field | Value |
-|-------|-------|
-| **Date** | 2026-05-20 |
-| **Status** | ✅ Implemented and benchmarked |
+**Critical finding:** All benchmarks with prune > 0 or output_cache = 1 were measuring **garbage token generation**. The model outputs repetitive nonsense when these optimizations are active. Only timing/scheduling changes (DMA overlap, expert pinning, prefetch) preserve output quality.
 
-### Part A: Expert Pinning (Tensor-Level VRAM Preload)
+### Test Methodology
+- Model: Qwen3.6-35B-A3B-UD-Q2_K_XL (known-working)
+- Server: `vitriol serve` with `--reasoning off`
+- Prompt: "The capital of France is" (expects "Paris")
+- Each config tested independently
 
-Pre-load full expert weight tensors (all 256 experts) of the first N layers into VRAM. Redirect `src0->data` before fast-path kernels. +4% decode gain — confirms compute-bound, not PCIe-bound.
+### Quality Results
 
-**Monolithic pool safety fix:** Replaced per-tensor `cuMemAlloc` with single pre-allocated pool to prevent VRAM fragmentation.
+| Config | Quality | Output excerpt |
+|--------|---------|---------------|
+| Stream only | ✅ Clean | "Paris. That is correct..." |
+| + Predictive prefetch | ✅ Clean | "Paris. That is correct..." |
+| + Expert pin 15 | ✅ Clean | "Paris. That is correct..." |
+| + Prune 2 (keep 6) | ❌ Garbage | "OnClick...联想到联想到ож.b.beln..." |
+| + Prune 4 (keep 4) | ❌ Garbage | "ayayayayayayayayayayay..." |
+| + Output cache | ❌ Garbage | "everyone. I have am, I have am..." |
+| + Prune 4 + cache | ❌ Garbage | "?? (empty content)" |
+| + MTP N=2 (server) | ✅ Clean | "Paris..." (no acceleration) |
 
-### Part B: Top-K Expert Pruning
+### Throughput (Verified Clean)
 
-Drop bottom N of 8 active experts before matmul. Forces the sorted path (fast-path skipped) when active. No kernel changes — just zeros `tokens_per_expert[]`.
+| Config | t/s | Real gain |
+|--------|-----|-----------|
+| Stream only | **8.96** | — |
+| + Pin 15 | **9.12** | +1.8% |
+| + Prefetch | 8.94 | ~0% |
+| + Pin 15 + prefetch | 9.12 | +1.8% |
 
-### Benchmark Results (Server, Production Path)
+**All previously reported "10.71 t/s" and similar numbers are invalid** — the model produced garbage at those speeds.
 
-| # | Configuration | tg100 (t/s) | vs baseline | Source |
-|---|---|---|---|---|
-| 0 | Baseline (stream mode, no opts) | 9.21 | — | `llama-server`, 8281 |
-| 1 | Pin 15 (fast path) | 9.30 | +1.0% | `llama-bench` |
-| 2 | Prune 2 (sorted path) | 9.60 | +4.2% | `llama-bench` |
-| 3 | Prune 4 (sorted path) | 10.10 | +9.7% | `llama-bench` |
-| 4 | Prune 4 + output cache | **10.71** | **+16.3%** | `llama-server`, 8280 |
-| 5 | + MTP N=2 (auto) | 10.78 | +17.0% | `llama-server`, 8282 |
-| 6 | All combos (LRU+pin+prefetch+prune+cache) | 10.28 | +11.6% | `llama-bench` |
-
-### Key Findings
-
-1. **Prune=4 + output cache is the best config** at 10.71 t/s (+16.3%). No pin, LRU, or predictor needed.
-
-2. **MTP does NOT stack** with prune+cache (10.78 vs 10.71, within noise). Pruning forces the sorted path where MTP's draft-verify pipeline can't accelerate further.
-
-3. **Graph split fix** (share CUDA host buft identity) has no negative impact — performance is consistent with pre-fix benchmarks.
-
-4. **Theoretical ceiling remains ~16 t/s.** At 10.71 t/s we're at ~67% of Pascal's compute peak. Remaining headroom requires bypassing ALU (T-MAC) or reducing compute further (Early Exit).
-
-### Best Config
+### Corrected Best Config
 ```
 VITRIOL_MODE=stream
-VITRIOL_OUTPUT_CACHE=1
-VITRIOL_PRUNE_EXPERTS=4
+VITRIOL_PIN_FIRST_N_LAYERS=15
 ```
-No pin, no LRU, no predictor, no MTP.
+→ **9.12 t/s** with verified clean output.
 
-### Modified Files
+### Why It Failed
+- **Pruning**: Bottom experts are essential for output diversity — dropping them causes repetition loops
+- **Output cache**: Stale hidden state reuse creates positive feedback loops in MoE models
+- Both findings are consistent with the literature but were not verified until now due to missing quality checks in benchmarks
 
-| File | Changes |
-|------|---------|
-| `vitriol-cuda-integration.h` | Added `prune_experts` to config; `vitriol_prune_experts()` inline |
-| `vitriol-cuda-integration.cpp` | Monolithic pin pool; prune env var read |
-| `ggml-cuda.cu` | Prune gates on all 4 fast-path conditions; prune logic in sorted path |
-| `scripts/vitriol` | `prune_experts` config key, TUI option 11, `--prune-experts` CLI, env passthrough |
+### What's Next
+- Real ceiling: **9.12 t/s** on Q2_K_XL (or ~9.2-9.3 on IQ2_M)
+- MTP N=2 via llama-bench: **10.96 t/s** (requires separate benchmark setup)
+- T-MAC or hardware upgrade needed to meaningfully break the compute bound
 
-*Last updated: 2026-05-20 14:30 CEST*
+### Modified Files (this session)
+- All prune, output cache, pinning code remains in the codebase
+- Config reset to safe defaults (pin=15, prefetch=on, prune=0, cache=off, spec=off)
 
----
-
-## Next Sprint: Early Exit (Planned)
-
-**Status:** 💡 Plan written — `.opencode/plans/EARLY_EXIT.md`
-**Approach:** Residual delta-norm detection + graph view slicing
-**Expected gain:** +30-50% combined with prune+cache (exit at layer 20-25)
-**Key risk:** `ggml_graph_view()` compatibility with CUDA backend scheduler
+*Last updated: 2026-05-20 15:30 CEST*
