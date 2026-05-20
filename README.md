@@ -36,6 +36,7 @@ VITRIOL has several feature flags that control memory, context efficiency, and r
 | Flag | Effect | tok/s impact | Use Case |
 |------|--------|-------------|----------|
 | `--spec-type mtp` / `--spec-draft-n-max 2` | MTP speculative decoding (+20% gen) | +20% | Max throughput (requires MTP-capable model) |
+| `--prune-experts N` | Top-K pruning: drop bottom N of 8 experts | +21.5% | Max throughput (experimental, may affect quality) |
 | `--cache-type-k q4_0` / `--cache-type-v q4_0` | KV cache quantized to 4-bit | Required at 256K | Reduces host KV from 5000→1406 MiB; without it, RAM exceeds 15 GB |
 | `--kv-mode offload` | KV cache in host RAM | Enables 256K context | Long context coding |
 | `--kv-mode sparse` | Attention-score eviction (4-8x compression) | Saves host RAM | Extreme context length |
@@ -424,6 +425,18 @@ VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe,
 | **[PowerInfer](https://github.com/SJTU-IPADS/PowerInfer)** (SJTU-IPADS) | Neuron-level offloading with predictor for which neurons will fire — only loads those into GPU. Informs our predictive prefetching approach. |
 | **Qwen3.6-35B-A3B MoE** | 256 experts, 8 active per token — the exact sparsity architecture that makes expert streaming viable. The MoE router (`ffn_gate_inp`) determines which 8 experts to load; only those need to be in VRAM. |
 
+### 🏆 VITRIOL-Implemented Techniques
+
+| Technique | Prior Art | VITRIOL Implementation |
+|-----------|-----------|----------------------|
+| **RAM Shot** (page-locked host RAM) | LLM in a Flash (Apple, 2023) | `vitriol-buffer.cpp` — mmap+mlock+cudaHostRegister |
+| **LRU VRAM cache** | HOBBIT (2024), KTransformers | Composite key (tensor_base, expert_idx), dedicated CUDA stream |
+| **Fire-and-Forget DMA overlap** | PreScope (2025), Fate (2025) | `vitriol_lru_prefetch_async` — async H2D, cuStreamWaitEvent on cache hit |
+| **Predictive prefetching** | Fate (2025), PowerInfer | Cross-layer + temporal heuristic, no training needed |
+| **Expert Pinning** (tensor VRAM preload) | HOBBIT (2024) | Monolithic VRAM pool, scoped src0 redirect before fast-path |
+| **Top-K Expert Pruning** | MoQE (Microsoft, 2023) | Drop bottom N of 8 experts before matmul, forces sorted path |
+| **Approximate Output Cache** | Hidden State Sluggishness | Per-expert per-layer output float vector reuse across tokens |
+
 ### Speculative Decoding
 
 | Paper / Project | What We Learned |
@@ -454,12 +467,13 @@ VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe,
 | Paper / Project | What We Learned |
 |-----------------|-----------------|
 | **[Fiddler](https://arxiv.org/abs/2402.14103)** — Kamahori, Gu, Zhu, Kasikci (2024) | Demonstrated that moving *activations* to CPU for MoE expert computation can be faster than pulling weights to GPU via PCIe DMA. Informs future `--engine-mode fiddler-cpu`. |
-| **[T-MAC](https://github.com/microsoft/T-MAC)** (Microsoft, 2024) | Lookup-table-based CPU inference for low-bit models. Accelerates ternary math on CPUs without AVX-512. |
+| **[T-MAC](https://github.com/microsoft/T-MAC)** (Microsoft, 2024) | Lookup-table-based inference for low-bit models. Originally CPU-focused (LUTs in L1 cache), but the concept applies to GPUs: replace ALU multiply with SRAM lookup for 1-2 bit weights. **VITRIOL plan:** Implement GPU LUT matmul (see `.opencode/plans/T-MAC_LUT_MATMUL.md`). |
 
 ### Extreme Quantization & Compute
 
 | Paper / Project | What We Learned |
 |-----------------|-----------------|
+| **[T-MAC](https://github.com/microsoft/T-MAC)** (Microsoft, 2024) | Lookup-table-based matmul for low-bit models. On GPU: pre-compute all possible dot products (~768 for INT8 act × ternary weight) into shared memory LUT, replace 16-bit multiply with 2-cycle SRAM fetch. Bypasses ALU bottleneck entirely on Pascal. **Potential: 2-3× throughput for TQ1_0/IQ2 models.** |
 | **[3LTERN](https://github.com/ELX987/3LTERN)** (ELX987) | W1.58A8 (1.58-bit ternary) CUDA kernel for Pascal. 16 weights packed per uint32, branchless decode via `bit0 - bit1`, `__dp4a` instruction on sm_61. Future optimization path for compute-bound layers. |
 | **[Unsloth](https://huggingface.co/unsloth)** (Daniel & Michael) | Dynamic quantization formats (UD-Q2_K_XL) that are structurally superior to raw 1.58-bit. Ungated model distribution — their Qwen 3.6 releases don't require HF authentication. The model we target was quantized and distributed by them. |
 | **[MoQE](https://arxiv.org/abs/2310.14713)** — Kim, Fahim, Awadalla (Microsoft, 2023) | MoE experts are robust to extreme low-bit quantization (2-bit) without losing base model coherence. Supports our asymmetric quantization approach. |
