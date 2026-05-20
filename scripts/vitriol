@@ -1069,7 +1069,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && echo "  Draft N-Max: $SPEC_DRAFT_N_MAX"
         [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && echo "  Pin Layers:  $PIN_FIRST_N_LAYERS (expert tensors in VRAM)"
         if [[ "${PRUNE_EXPERTS:-0}" -gt 0 ]]; then
-            local prune_keep=$((8 - PRUNE_EXPERTS))
+            prune_keep=$((8 - PRUNE_EXPERTS))
             echo "  Expert Prune: $PRUNE_EXPERTS (keeping $prune_keep of 8)"
         fi
         echo "  Binary:      $BINARY"
@@ -1261,7 +1261,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && echo "  Draft N-Max: $SPEC_DRAFT_N_MAX"
         [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && echo "  Pin Layers:  $PIN_FIRST_N_LAYERS (expert tensors in VRAM)"
         if [[ "${PRUNE_EXPERTS:-0}" -gt 0 ]]; then
-            local prune_keep=$((8 - PRUNE_EXPERTS))
+            prune_keep=$((8 - PRUNE_EXPERTS))
             echo "  Expert Prune: $PRUNE_EXPERTS (keeping $prune_keep of 8)"
         fi
         if [[ "$MEMORY_MODE" == "on" ]]; then
@@ -1294,6 +1294,8 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && SPEC_ARGS="$SPEC_ARGS --spec-draft-n-max $SPEC_DRAFT_N_MAX"
         # Flash Attention is required for V cache quantization and generally faster
         FA_ARGS="-fa on"
+        # Reasoning off is required for Qwen3.6 models (thinking mode corrupts output)
+        REASONING_ARGS="--reasoning off"
 
         if $DETACH; then
             echo "Starting server in background..."
@@ -1335,7 +1337,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                         --parallel "$PARALLEL" \
                         --no-mmap \
                          -t "$THREADS" \
-                            $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS \
+                            $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS $REASONING_ARGS \
                             "$@" &>"${CONFIG_DIR}/llama-server.log" &
                 echo $! > "${CONFIG_DIR}/llama-server.pid"
                 echo "  llama-server PID: $! (internal port $LLAMA_PORT)"
@@ -1389,7 +1391,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                         --parallel "$PARALLEL" \
                         --no-mmap \
                         -t "$THREADS" \
-                        $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS \
+                        $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS $REASONING_ARGS \
                         "$@" &>"${CONFIG_DIR}/server.log" &
                 echo $! > "${CONFIG_DIR}/server.pid"
                 echo "  Server PID: $!"
@@ -1442,7 +1444,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                         --port "$LLAMA_PORT" \
                         --parallel "$PARALLEL" \
                         --no-mmap \
-                        -t "$THREADS" $KV_CACHE_ARGS $FA_ARGS &
+                        -t "$THREADS" $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS $REASONING_ARGS &
                 LLAMA_PID=$!
                 echo "  llama-server running (PID $LLAMA_PID, internal port $LLAMA_PORT)"
 
@@ -1495,7 +1497,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                     --parallel "$PARALLEL" \
                     --no-mmap \
                     -t "$THREADS" \
-                    $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS \
+                    $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS $REASONING_ARGS \
                     "$@"
             fi
         fi

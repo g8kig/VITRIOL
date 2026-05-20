@@ -623,18 +623,17 @@ VITRIOL_PIN_FIRST_N_LAYERS=15
 - **MTP N=2 benchmark**: Once IQ2_M works, re-run the MTP benchmark to verify 10.96 t/s with clean output.
 - **T-MAC / hardware upgrade**: The 9.12 t/s ceiling is real. T-MAC (TQ1_0 format) or a GPU upgrade are the only paths to significantly higher throughput.
 
-### Final Production Config (2026-05-20)
-```
-model.path  = /home/randozart/Downloads/koboldcpp/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
-model.context = 256000
-vitriol.mode = stream
-vitriol.pin_first_n_layers = 15
-vitriol.predictive_prefetch = on
-vitriol.output_cache = off
-vitriol.prune_experts = 0
-spec.type = (empty)
-spec.draft_n_max = 0
-```
-→ **9.12 t/s** with verified clean output.
+### Final Verified Best Config (2026-05-20)
 
-*Last updated: 2026-05-20 16:00 CEST*
+The IQ2_M tokenizer issue was simply `--reasoning off`. The GGUF has `thinking = 1` in its chat template. Adding this flag produces clean output and enables MTP.
+
+```
+model  = Qwen3.6-35B-A3B-UD-IQ2_M.gguf (MTP-capable)
+mode   = stream
+spec   = mtp N=2
+args   = --reasoning off
+```
+→ **17.62 t/s** with verified clean output. MTP acceptance rate: 98.5% (65/66 drafts).
+The `--reasoning off` flag is now hardcoded in `vitriol serve` server args.
+
+*Last updated: 2026-05-20 16:15 CEST*

@@ -69,16 +69,16 @@ The problem: the best open-weight models are MoE architectures (Mixture of Exper
 
 VITRIOL's insight: MoE models only activate ~2-8 out of 256 experts per token. The expert weights don't need to live in VRAM. Keep them in **page-locked system RAM** instead — the GPU reads them over PCIe DMA on demand. The base model, attention weights, KV cache, and compute buffers stay in VRAM. Only the experts are offloaded.
 
-**Result:** 10.71 tok/s on a GTX 1070 Ti (8 GB) with a 34.66B-parameter 256-expert model — **+88% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL.
+**Result:** 17.62 tok/s on a GTX 1070 Ti (8 GB) with a 34.66B-parameter 256-expert model — **+209% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL.
 
 | Metric | Value |
 |--------|-------|
 | Model | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) (34.66B, 256 MoE experts, IQ2_M by Unsloth) |
 | GPU | GTX 1070 Ti (Pascal, 8 GB VRAM, PCIe Gen3 x16) |
 | CPU | Intel 4th gen (Haswell, no AVX2) |
-| Generation (Prune 4 + Cache) | **10.71 tok/s** |
-| Generation (MTP N=2) | 10.96 tok/s |
-| Generation (no opts) | 9.1 tok/s |
+| Generation (IQ2_M + MTP N=2) | **17.62 tok/s** |
+| Generation (Q2_K_XL + pin 15) | 9.12 tok/s |
+| Generation (no opts) | 8.9 tok/s |
 | VRAM saved | ~10 GB (experts stay in host RAM) |
 | System RAM used | ~11.5 GiB (10040 MiB buffer + 1406 MiB host KV) |
 | VRAM used | ~1.3 GiB (non-MTP) / ~1.6 GiB (with MTP head) |
@@ -238,22 +238,22 @@ Configure via `vitriol config` (TUI option 4) or `vitriol serve --memory-mode on
 
 ## Performance
 
-### Current Best: 10.71 tok/s
+### Current Best: 17.62 tok/s
 
-System: GTX 1070 Ti (PCIe Gen3 x16), 15 GB RAM, IQ2_M model, 256K context, Q4_0 KV.
+System: GTX 1070 Ti (PCIe Gen3 x16), 15 GB RAM, IQ2_M model, MTP N=2, 256K context, Q4_0 KV, `--reasoning off`.
 
 | Config | Gen (tok/s) | vs x8 baseline |
 |--------|------------|----------------|
 | PCIe x8 (GTX 960 present, no VITRIOL) | 5.7 | — |
-| PCIe x16 (GTX 960 removed) | 9.1 | +60% |
-| + Prune 4 + Output Cache | **10.71** | **+88%** |
-| + MTP N=2 (separate test) | 10.96 | +92% |
+| PCIe x16 (GTX 960 removed) | 8.9 | +56% |
+| + IQ2_M + MTP N=2 | **17.62** | **+209%** |
+| + Q2_K_XL + pin 15 (no MTP) | 9.12 | +60% |
 
 **Key findings:**
-- **Best practical config:** `VITRIOL_PRUNE_EXPERTS=4` + `VITRIOL_OUTPUT_CACHE=1` at **10.71 t/s**
-- MTP N=2 gives 10.96 t/s but does NOT stack with prune+cache (same compute bottleneck)
-- MTP acceptance rate = exactly `1/N` — N=2 is optimal
-- Expert Pinning, LRU, predictor add negligible gain when prune+cache is active
+- **Best config:** IQ2_M model with `--spec-type mtp --spec-draft-n-max 2 --reasoning off` at **17.62 t/s**
+- MTP acceptance rate: ~98.5% (N=2 optimal)
+- `--reasoning off` required for Qwen3.6 models (thinking mode corrupts output tokenizer)
+- Prune > 0 and output cache break output quality (repetition loops)
 
 See full sweep data in [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md#mtp-draft-n-max-sweep-2026-05-19), [`docs/FINDINGS_2026-05-19.md`](docs/FINDINGS_2026-05-19.md), and [`docs/plans/COMPUTE_OPTIMIZATIONS.md`](docs/plans/COMPUTE_OPTIMIZATIONS.md).
 
