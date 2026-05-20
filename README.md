@@ -52,7 +52,7 @@ All flags can be set via CLI flag, env var, or the TUI (`vitriol config`).
 
 **Recommended settings:** [`docs/RECOMMENDED_SETTINGS.md`](docs/RECOMMENDED_SETTINGS.md) — exact optimal config for the GTX 1070 Ti system.
 
-**Optimization catalog:** [`docs/OPTIMIZATIONS_2026-05-19.md`](docs/OPTIMIZATIONS_2026-05-19.md) — prior art, viability analysis, and roadmap for further optimization.
+**Optimization plans:** [`docs/plans/`](docs/plans/) — 5 master plans covering compute, memory, speculative decoding, early exit, and graph optimizations.
 
 **Findings log:** [`docs/FINDINGS_2026-05-19.md`](docs/FINDINGS_2026-05-19.md) — detailed benchmark sweep results, floundering log, and lessons learned.
 
@@ -69,15 +69,16 @@ The problem: the best open-weight models are MoE architectures (Mixture of Exper
 
 VITRIOL's insight: MoE models only activate ~2-8 out of 256 experts per token. The expert weights don't need to live in VRAM. Keep them in **page-locked system RAM** instead — the GPU reads them over PCIe DMA on demand. The base model, attention weights, KV cache, and compute buffers stay in VRAM. Only the experts are offloaded.
 
-**Result:** 10.96 tok/s on a GTX 1070 Ti (8 GB) with a 34.66B-parameter 256-expert model — **+92% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL.
+**Result:** 10.71 tok/s on a GTX 1070 Ti (8 GB) with a 34.66B-parameter 256-expert model — **+88% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL.
 
 | Metric | Value |
 |--------|-------|
-| Model | Qwen3.6-35B-A3B (34.66B, 256 MoE experts) |
+| Model | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) (34.66B, 256 MoE experts, IQ2_M by Unsloth) |
 | GPU | GTX 1070 Ti (Pascal, 8 GB VRAM, PCIe Gen3 x16) |
 | CPU | Intel 4th gen (Haswell, no AVX2) |
-| Generation (MTP N=2) | **10.96 tok/s** |
-| Generation (no MTP) | 9.1 tok/s |
+| Generation (Prune 4 + Cache) | **10.71 tok/s** |
+| Generation (MTP N=2) | 10.96 tok/s |
+| Generation (no opts) | 9.1 tok/s |
 | VRAM saved | ~10 GB (experts stay in host RAM) |
 | System RAM used | ~11.5 GiB (10040 MiB buffer + 1406 MiB host KV) |
 | VRAM used | ~1.3 GiB (non-MTP) / ~1.6 GiB (with MTP head) |
@@ -118,7 +119,7 @@ access via native GDDR5 bandwidth. **However, it is never reached for quantized 
 the LRU code. See [`docs/LRU_DIAGNOSTIC_FINDING.md`](docs/LRU_DIAGNOSTIC_FINDING.md) for the
 full diagnosis.
 
-Future VITRIOL-level Expert Pinning (see [`docs/OPTIMIZATIONS_2026-05-19.md`](docs/OPTIMIZATIONS_2026-05-19.md))
+Future VITRIOL-level Expert Pinning (see [`docs/plans/EXPERT_PINNING_V2.md`](docs/plans/EXPERT_PINNING_V2.md))
 will provide the same benefit — keeping frequent experts in VRAM — without modifying
 llama.cpp's kernel dispatch.
 
@@ -154,6 +155,7 @@ With VITRIOL:
 vitriol run [options]      interactive inference session
 vitriol serve [options]    persistent HTTP API server
 vitriol stop               stop running server
+vitriol bench [options]    quick throughput benchmark (uses llama-bench)
 vitriol config             interactive configuration TUI
 vitriol config show        print current configuration
 vitriol config init        create config file with defaults
@@ -173,6 +175,9 @@ Run options:
   --kv-quant MODE     KV cache quantization: f16 | q8_0 | q4_0 (must be q4_0 for 256K)
   --spec-type TYPE    speculative decoding: mtp | draft (default: disabled)
   --spec-draft-n-max N  tokens to draft per cycle (default: 0, recommended: 2)
+  --pin-layers N       pin first N layers' expert tensors in VRAM
+  --prune-experts N    drop bottom N of 8 active experts (0-7, experimental)
+  --predictive-prefetch on|off  cross-layer expert prefetch (DMA stream overlap)
   --verbose      enable debug logging
   --dry-run      print config without launching
 
@@ -189,9 +194,16 @@ Serve options:
   --kv-quant MODE     KV cache quantization: f16 | q8_0 | q4_0 (must be q4_0 for 256K)
   --spec-type TYPE    speculative decoding: mtp | draft (default: disabled)
   --spec-draft-n-max N  tokens to draft per cycle (default: 0, recommended: 2)
+  --pin-layers N       pin first N layers' expert tensors in VRAM
+  --prune-experts N    drop bottom N of 8 active experts (0-7, experimental)
+  --predictive-prefetch on|off  cross-layer expert prefetch (DMA stream overlap)
   --detach       run server in background
   --verbose      enable debug logging
   --dry-run      print config without launching
+
+Bench options:
+  vitriol bench -n 100        generate 100 tokens, report t/s
+  All VITRIOL_MODE, --prune-experts, --pin-layers flags apply
 ```
 
 Config persisted in `~/.vitriol/config`. Precedence: CLI flag > Config > Env var > Default.
@@ -226,19 +238,24 @@ Configure via `vitriol config` (TUI option 4) or `vitriol serve --memory-mode on
 
 ## Performance
 
-### Current Best: 10.96 tok/s
+### Current Best: 10.71 tok/s
 
-System: GTX 1070 Ti (PCIe Gen3 x16), 15 GB RAM, IQ2_M model, MTP N=2, 256K context, Q4_0 KV.
+System: GTX 1070 Ti (PCIe Gen3 x16), 15 GB RAM, IQ2_M model, 256K context, Q4_0 KV.
 
 | Config | Gen (tok/s) | vs x8 baseline |
 |--------|------------|----------------|
 | PCIe x8 (GTX 960 present, no VITRIOL) | 5.7 | — |
-| PCIe x16 (GTX 960 removed, Q2_K_XL) | 9.1 | +60% |
-| + MTP N=2 (IQ2_M model) | **10.96** | **+92%** |
+| PCIe x16 (GTX 960 removed) | 9.1 | +60% |
+| + Prune 4 + Output Cache | **10.71** | **+88%** |
+| + MTP N=2 (separate test) | 10.96 | +92% |
 
-**Key finding:** MTP acceptance rate = exactly `1/N` — N=2 is optimal. Higher draft values waste PCIe bandwidth on rejected tokens.
+**Key findings:**
+- **Best practical config:** `VITRIOL_PRUNE_EXPERTS=4` + `VITRIOL_OUTPUT_CACHE=1` at **10.71 t/s**
+- MTP N=2 gives 10.96 t/s but does NOT stack with prune+cache (same compute bottleneck)
+- MTP acceptance rate = exactly `1/N` — N=2 is optimal
+- Expert Pinning, LRU, predictor add negligible gain when prune+cache is active
 
-See full sweep data in [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md#mtp-draft-n-max-sweep-2026-05-19) and [`docs/FINDINGS_2026-05-19.md`](docs/FINDINGS_2026-05-19.md#mtp-draft-n-max-sweep-2026-05-19).
+See full sweep data in [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md#mtp-draft-n-max-sweep-2026-05-19), [`docs/FINDINGS_2026-05-19.md`](docs/FINDINGS_2026-05-19.md), and [`docs/plans/COMPUTE_OPTIMIZATIONS.md`](docs/plans/COMPUTE_OPTIMIZATIONS.md).
 
 ### VRAM at 256K Context
 
@@ -388,7 +405,14 @@ See `docs/EMULATED_MEMORY_ARCHITECTURE.md` for the full design (DB schema, scori
 │   ├── FINDINGS_2026-05-19.md              ← Benchmark sweeps, floundering log
 │   ├── BENCHMARK_RESULTS.md               ← All benchmark data across configs
 │   └── EMULATED_MEMORY_ARCHITECTURE.md     ← Memory design doc
-├── EXPERIMENT_LOG.md        ← Complete test history (10 experiments)
+├── EXPERIMENT_LOG.md        ← Complete test history (15 experiments)
+├── docs/plans/              ← Master optimization plans (5 consolidated docs)
+│   ├── COMPUTE_OPTIMIZATIONS.md  ← T-MAC, Top-K Prune, all ALU-bypass approaches
+│   ├── MEMORY_OPTIMIZATIONS.md  ← Expert Pinning, LRU, Output Cache, Asymmetric
+│   ├── EARLY_EXIT.md            ← Residual stagnation detection (implemented, negative result)
+│   ├── SPECULATIVE_DECODING.md  ← MTP + speculative routing plans
+│   └── GRAPH_OPTIMIZATIONS.md   ← Graph split fix, scheduler improvements
+├── .opencode/plans/         ← OpenCode-local copies (not on GitHub)
 ├── SESSION_LOG_2026-05-17.md ← This session's progress report
 ├── ROADMAP.md               ← Phased development plan
 ├── MILESTONE_1.md           ← Failed approaches archive (7 approaches)
@@ -436,6 +460,8 @@ VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe,
 | **Expert Pinning** (tensor VRAM preload) | HOBBIT (2024) | Monolithic VRAM pool, scoped src0 redirect before fast-path |
 | **Top-K Expert Pruning** | MoQE (Microsoft, 2023) | Drop bottom N of 8 experts before matmul, forces sorted path |
 | **Approximate Output Cache** | Hidden State Sluggishness | Per-expert per-layer output float vector reuse across tokens |
+| **Graph Split Fix** | N/A (VITRIOL-specific) | Share CUDA host buft identity to reduce scheduler splits from 17 to 2 |
+| **Early Exit Infrastructure** | DeeBERT, PABEE | `n_build_layers` graph param, residual delta detection |
 
 ### Speculative Decoding
 
@@ -467,7 +493,7 @@ VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe,
 | Paper / Project | What We Learned |
 |-----------------|-----------------|
 | **[Fiddler](https://arxiv.org/abs/2402.14103)** — Kamahori, Gu, Zhu, Kasikci (2024) | Demonstrated that moving *activations* to CPU for MoE expert computation can be faster than pulling weights to GPU via PCIe DMA. Informs future `--engine-mode fiddler-cpu`. |
-| **[T-MAC](https://github.com/microsoft/T-MAC)** (Microsoft, 2024) | Lookup-table-based inference for low-bit models. Originally CPU-focused (LUTs in L1 cache), but the concept applies to GPUs: replace ALU multiply with SRAM lookup for 1-2 bit weights. **VITRIOL plan:** Implement GPU LUT matmul (see `.opencode/plans/T-MAC_LUT_MATMUL.md`). |
+| **[T-MAC](https://github.com/microsoft/T-MAC)** (Microsoft, 2024) | Lookup-table-based inference for low-bit models. Originally CPU-focused (LUTs in L1 cache), but the concept applies to GPUs: replace ALU multiply with SRAM lookup for 1-2 bit weights. **VITRIOL plan:** Implement GPU LUT matmul (see [`docs/plans/T-MAC_LUT_MATMUL.md`](docs/plans/T-MAC_LUT_MATMUL.md) and [`docs/plans/COMPUTE_OPTIMIZATIONS.md`](docs/plans/COMPUTE_OPTIMIZATIONS.md)). |
 
 ### Extreme Quantization & Compute
 
