@@ -636,4 +636,45 @@ args   = --reasoning off
 → **17.62 t/s** with verified clean output. MTP acceptance rate: 98.5% (65/66 drafts).
 The `--reasoning off` flag is now hardcoded in `vitriol serve` server args.
 
-*Last updated: 2026-05-20 16:15 CEST*
+---
+
+## Experiment 17: V Cache Quantization Bug (2026-05-21)
+
+### Finding
+`--cache-type-v q4_0` (and any non-f16 V cache quantization) produces `?` garbage output when combined with VITRIOL and flash attention. K-only quantization (`--cache-type-k q4_0`) is clean.
+
+### Test Setup
+- Server: `llama.cpp/build/bin/llama-server` (b101-e6487cdaf)
+- GPU: GTX 1070 Ti (8 GB VRAM, CC 6.1, PCIe 3.0 x16)
+- Model: Qwen3.6-35B-A3B-UD-Q2_K_XL (12 GB GGUF)
+- VITRIOL: stream mode, pin=15, prefetch=on, `--reasoning off`, `--no-mmap`, `-fa on`
+
+### Results
+
+| `--cache-type-k` | `--cache-type-v` | Output | KV Cache |
+|-----------------|-----------------|--------|----------|
+| — | — | ✅ Clean | K f16, V f16 |
+| q4_0 | — | ✅ Clean | K q4_0, V f16 |
+| — | q4_0 | ❌ `?????` | K f16, V q4_0 |
+| q4_0 | q4_0 | ❌ `?????` | K q4_0, V q4_0 |
+| q4_0 | q8_0 | ❌ `?????` | K q4_0, V q8_0 |
+| — | q8_0 | ❌ `?????` | K f16, V q8_0 |
+
+### Root Cause
+VITRIOL intercepts only MoE expert tensors (`ffn_down_exps`, `ffn_gate_exps`, `ffn_up_exps`) into page-locked host RAM. The KV cache stays entirely in GPU VRAM. The bug is in **llama.cpp's flash attention V dequantization path for the `qwen35moe` architecture** (Gated Delta Net/SSM with `full_attention_interval=4`, creating a sparse 10/40-layer KV layout).
+
+The `--cache-type-v` flag was removed from the vitriol script at `scripts/vitriol:1327`. Only `--cache-type-k` is passed now.
+
+### Current Best Config (IQ2_M + MTP, Verified Clean)
+```
+model  = Qwen3.6-35B-A3B-UD-IQ2_M.gguf
+mode   = stream
+spec   = mtp N=2
+pin    = 8
+args   = --reasoning off --cache-type-k q4_0 -fa on
+```
+→ **12.82 tok/s** (MTP: 5/6 drafts accepted, 83%).
+
+Note: `pin_first_n_layers` reduced from 15→8 for IQ2_M due to increased VRAM pressure from MTP head + pin pool.
+
+*Last updated: 2026-05-21 17:30 CEST**

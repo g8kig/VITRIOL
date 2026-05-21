@@ -584,7 +584,7 @@ def proxy_chat_completions():
             logger.info("Metadata stripped from context")
 
         data['messages'] = rectified_messages
-        data['max_tokens'] = min(data.get('max_tokens', 1024), 1024)
+        data['max_tokens'] = min(data.get('max_tokens', 4096), 32768)
         is_stream = data.get('stream', False)
 
         bstatus = backend_status()

@@ -47,9 +47,11 @@ tokens = 0
 
 ```
 vitriol serve --detach \
-  --cache-type-k q4_0 --cache-type-v q4_0 \
+  --cache-type-k q4_0 \
   -fa on --no-mmap
 ```
+
+**⚠️  `--cache-type-v q4_0` is forbidden.** V cache quantization corrupts output with VITRIOL (see EXPERIMENT_LOG.md Experiment 17). Only K cache is quantized; V cache stays at f16 precision.
 
 These are automatically wired by the vitriol script from config settings. Pass them explicitly only when bypassing the script.
 
@@ -77,7 +79,7 @@ draft_n_max = 2
 | `mode = stream` | Only mode that page-locks RAM for VITRIOL DMA. Sync/async/off won't work. |
 | `lru_mb = 0` | LRU cache is unreachable on quantized MoE models (FP16 only). |
 | `kv.mode = offload` | Moves KV cache from VRAM to host, leaving room for compute buffers. |
-| `kv.quant_mode = q4_0` | Reduces host KV allocation from 5000 MiB (F16) to 1406 MiB. Without this, total exceeds 15 GB RAM → silent OOM. |
+| `kv.quant_mode = q4_0` | K cache q4_0 reduces GPU VRAM by ~920 MiB vs f16. **V cache stays f16** — `--cache-type-v q4_0` corrupts output (Experiment 17). |
 | `frozen_prompt = on` | Keeps system prompt static to avoid re-prefix on each request. |
 | `engine.mode = vitriol-dma` | Enables the CUDA expert intercept layer. Native mode = no VITRIOL. |
 | `exclude_secondary = true` | Prevents CUDA from seeing the GTX 960 (CC 5.2, no kernel images). |
@@ -88,4 +90,4 @@ draft_n_max = 2
 |--------|------------|----------------|
 | PCIe x8 (GTX 960 present) | 5.7 | — |
 | PCIe x16 (GTX 960 removed) | 9.1 | +60% |
-| + MTP N=2 (IQ2_M model) | 10.96 | +92% |
+| + IQ2_M + MTP N=2 + pin 8 | 12.82 | +125% |

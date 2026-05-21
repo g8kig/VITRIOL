@@ -37,7 +37,7 @@ VITRIOL has several feature flags that control memory, context efficiency, and r
 |------|--------|-------------|----------|
 | `--spec-type mtp` / `--spec-draft-n-max 2` | MTP speculative decoding (+20% gen) | +20% | Max throughput (requires MTP-capable model) |
 | `--prune-experts N` | Top-K pruning: drop bottom N of 8 experts | +16% | Max throughput (experimental, may affect quality) |
-| `--cache-type-k q4_0` / `--cache-type-v q4_0` | KV cache quantized to 4-bit | Required at 256K | Reduces host KV from 5000→1406 MiB; without it, RAM exceeds 15 GB |
+| `--cache-type-k q4_0` | K cache quantized to 4-bit | Required at 256K | Reduces host KV by ~920 MiB; V cache stays f16. **Do not use `--cache-type-v`** — V cache quantization corrupts output with VITRIOL |
 | `--kv-mode offload` | KV cache in host RAM | Enables 256K context | Long context coding |
 | `--kv-mode sparse` | Attention-score eviction (4-8x compression) | Saves host RAM | Extreme context length |
 | `--frozen-prompt on` | Cache KV prefix across requests | Prefill saved | Repeated requests, same system prompt |
@@ -69,19 +69,19 @@ The problem: the best open-weight models are MoE architectures (Mixture of Exper
 
 VITRIOL's insight: MoE models only activate ~2-8 out of 256 experts per token. The expert weights don't need to live in VRAM. Keep them in **page-locked system RAM** instead — the GPU reads them over PCIe DMA on demand. The base model, attention weights, KV cache, and compute buffers stay in VRAM. Only the experts are offloaded.
 
-**Result:** 17.62 tok/s on a GTX 1070 Ti (8 GB) with a 34.66B-parameter 256-expert model — **+209% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL.
+**Result:** 12.82 tok/s on a GTX 1070 Ti (8 GB) with a 34.66B-parameter 256-expert model — **+125% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL.
 
 | Metric | Value |
 |--------|-------|
 | Model | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) (34.66B, 256 MoE experts, IQ2_M by Unsloth) |
 | GPU | GTX 1070 Ti (Pascal, 8 GB VRAM, PCIe Gen3 x16) |
 | CPU | Intel 4th gen (Haswell, no AVX2) |
-| Generation (IQ2_M + MTP N=2) | **17.62 tok/s** |
-| Generation (Q2_K_XL + pin 15) | 9.12 tok/s |
+| Generation (IQ2_M + MTP N=2 + pin 8) | **12.82 tok/s** ✅ (2026-05-21, server) |
+| Generation (Q2_K_XL + pin 15) | 9.88 tok/s |
 | Generation (no opts) | 8.9 tok/s |
 | VRAM saved | ~10 GB (experts stay in host RAM) |
-| System RAM used | ~11.5 GiB (10040 MiB buffer + 1406 MiB host KV) |
-| VRAM used | ~1.3 GiB (non-MTP) / ~1.6 GiB (with MTP head) |
+| System RAM used | ~11.5 GiB (10040 MiB buffer + 360 MiB KV K q4_0 + 1280 MiB KV V f16) |
+| VRAM used | ~1.3 GiB (non-MTP) / ~1.6 GiB (with MTP head + pin pool) |
 
 
 ## How It Works
@@ -172,9 +172,9 @@ Run options:
   -ngl N         GPU layers to offload
   -lru MB        LRU VRAM cache size (inactive for quantized models)
   --memory-mode MODE  emulated memory: on | off (default: off)
-  --kv-quant MODE     KV cache quantization: f16 | q8_0 | q4_0 (must be q4_0 for 256K)
+  --kv-quant MODE     KV K-cache quantization: f16 | q8_0 | q4_0. **Warning:** only K cache is quantized. `--cache-type-v` is forbidden — V quantization corrupts output with VITRIOL (llama.cpp qwen35moe bug, see Experiment 17).
   --spec-type TYPE    speculative decoding: mtp | draft (default: disabled)
-  --spec-draft-n-max N  tokens to draft per cycle (default: 0, recommended: 2)
+  --spec-draft-n-max N  tokens to draft per cycle (default: 0, recommended: 2 for IQ2_M)
   --pin-layers N       pin first N layers' expert tensors in VRAM
   --prune-experts N    drop bottom N of 8 active experts (0-7, experimental)
   --predictive-prefetch on|off  cross-layer expert prefetch (DMA stream overlap)
@@ -191,7 +191,7 @@ Serve options:
   -port N        server port (default: 8279)
   -p N           parallel slots (default: 1)
   --memory-mode MODE  emulated memory: on | off (default: off)
-  --kv-quant MODE     KV cache quantization: f16 | q8_0 | q4_0 (must be q4_0 for 256K)
+  --kv-quant MODE     KV K-cache quantization: f16 | q8_0 | q4_0. **Warning:** only K cache is quantized. `--cache-type-v` is forbidden.
   --spec-type TYPE    speculative decoding: mtp | draft (default: disabled)
   --spec-draft-n-max N  tokens to draft per cycle (default: 0, recommended: 2)
   --pin-layers N       pin first N layers' expert tensors in VRAM
@@ -238,20 +238,21 @@ Configure via `vitriol config` (TUI option 4) or `vitriol serve --memory-mode on
 
 ## Performance
 
-### Current Best: 17.62 tok/s
+### Current Best: 12.82 tok/s (Server, Verified Clean)
 
-System: GTX 1070 Ti (PCIe Gen3 x16), 15 GB RAM, IQ2_M model, MTP N=2, 256K context, Q4_0 KV, `--reasoning off`.
+System: GTX 1070 Ti (PCIe Gen3 x16), 15 GB RAM, IQ2_M model, MTP N=2, 128K context, `--cache-type-k q4_0` (K only!), `--reasoning off`, pin=8.
 
-| Config | Gen (tok/s) | vs x8 baseline |
-|--------|------------|----------------|
-| PCIe x8 (GTX 960 present, no VITRIOL) | 5.7 | — |
-| PCIe x16 (GTX 960 removed) | 8.9 | +56% |
-| + IQ2_M + MTP N=2 | **17.62** | **+209%** |
-| + Q2_K_XL + pin 15 (no MTP) | 9.12 | +60% |
+| Config | Gen (tok/s) | vs x8 baseline | Notes |
+|--------|------------|----------------|-------|
+| PCIe x8 (GTX 960 present, no VITRIOL) | 5.7 | — | Pre-VITRIOL baseline |
+| PCIe x16 (GTX 960 removed) | 8.9 | +56% | Before MTP/pin |
+| + Q2_K_XL + pin 15 | 9.88 | +73% | ✅ Clean (no MTP) |
+| + IQ2_M + MTP N=2 + pin 8 | **12.82** | **+125%** | ✅ Clean (2026-05-21) |
 
 **Key findings:**
-- **Best config:** IQ2_M model with `--spec-type mtp --spec-draft-n-max 2 --reasoning off` at **17.62 t/s**
-- MTP acceptance rate: ~98.5% (N=2 optimal)
+- **Best config:** IQ2_M model with `--spec-type mtp --spec-draft-n-max 2 --reasoning off --cache-type-k q4_0` at **12.82 t/s** (verified clean, server-side)
+- MTP acceptance rate: ~83% (5/6 drafts accepted per cycle)
+- `--cache-type-v q4_0` **must not be used** — V cache quantization corrupts output with VITRIOL (likely a llama.cpp flash attention bug for the `qwen35moe` architecture; see Experiment 17)
 - `--reasoning off` required for Qwen3.6 models (thinking mode corrupts output tokenizer)
 - Prune > 0 and output cache break output quality (repetition loops)
 
@@ -263,7 +264,7 @@ See full sweep data in [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md#m
 |-----------|---------|---------------|
 | Model weights (GPU) | ~1337 MiB | ~1337 + 302 MiB |
 | VITRIOL buffer (RAM) | ~10040 MiB | ~10040 MiB |
-| KV cache (host, Q4_0) | ~1406 MiB | ~1406 MiB |
+| KV cache (K q4_0 + V f16, 128K ctx) | ~1640 MiB | ~1640 MiB |
 | Compute buffers | ~215 MiB | + overhead |
 | **Total VRAM** | **~1.3 GiB** | **~1.6 GiB** |
 | **Total system RAM** | **~11.5 GiB** | **~11.8 GiB** |
@@ -279,7 +280,7 @@ See full sweep data in [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md#m
 
 | GPU | VRAM | Status | Notes |
 |-----|------|--------|-------|
-| GTX 1070 Ti | 8 GB | ✅ Verified | PCIe 3.0 x16, **10.96 tok/s** (MTP N=2) |
+| GTX 1070 Ti | 8 GB | ✅ Verified | PCIe 3.0 x16, **12.82 tok/s** (IQ2_M, MTP N=2, pin=8) — confirmed 2026-05-21 |
 | RTX 3060 | 12 GB | ✅ Supported | More VRAM for larger KV cache |
 | RTX 4090 | 24 GB | ✅ Supported | PCIe 4.0 x16 → higher bandwidth |
 
@@ -297,7 +298,7 @@ which depends heavily on CPU vector extensions.
 - **OS:** Linux — Ubuntu 24.04, kernel 6.17+, NVIDIA driver 535.288.01, CUDA 12.2
 - **Models:** Qwen3.6-35B-A3B-UD-Q2_K_XL (baseline, ~2.2 bpw) / IQ2_M (MTP-capable, ~2.6 bpw)
 - **llama.cpp:** Pinned submodule with VITRIOL CUDA integration
-- **Context:** 256,000 tokens at Q4_0 KV quant (—cache-type-k/q4_0 required)
+- **Context:** 128,000 tokens at K q4_0 + V f16 KV quant (`--cache-type-k q4_0`; `--cache-type-v` is forbidden — see Experiment 17)
 
 ### Likely works
 - **NVIDIA GPUs with CC ≥ 5.0:** All Pascal, Turing, Ampere, Ada, Blackwell cards. The `cudaHostRegister` + PCIe DMA path is architecture-agnostic. Higher VRAM GPUs benefit from larger LRU cache or keeping more layers in VRAM.

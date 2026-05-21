@@ -1322,9 +1322,11 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         ENV_PREDICTIVE_PREFETCH=""
         [[ "$PREDICTIVE_PREFETCH" == "on" ]] && ENV_PREDICTIVE_PREFETCH="VITRIOL_PREDICTIVE_PREFETCH=1"
 
-        # KV cache quant args (pass to llama-server as --cache-type-k/v)
+        # KV cache quant args (pass to llama-server as --cache-type-k)
+        # NOTE: --cache-type-v causes garbage output with VITRIOL (expert offloading corrupts quantized V cache)
+        # Only quantize K cache; leave V at f16 precision.
         KV_CACHE_ARGS=""
-        [[ "$KV_QUANT" != "f16" ]] && KV_CACHE_ARGS="--cache-type-k $KV_QUANT --cache-type-v $KV_QUANT"
+        [[ "$KV_QUANT" != "f16" ]] && KV_CACHE_ARGS="--cache-type-k $KV_QUANT"
         # Speculative decoding args
         SPEC_ARGS=""
         [[ -n "$SPEC_TYPE" ]] && SPEC_ARGS="--spec-type $SPEC_TYPE"
