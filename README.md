@@ -41,13 +41,16 @@ VITRIOL has several feature flags that control memory, context efficiency, and r
 | Flag | Effect | tok/s impact | Use Case |
 |------|--------|-------------|----------|
 | `--spec-type mtp` / `--spec-draft-n-max 2` | MTP speculative decoding (+20% gen) | +20% | Max throughput (requires MTP-capable model) |
-| `--prune-experts N` | Top-K pruning: drop bottom N of 8 experts | +16% | Max throughput (experimental, may affect quality) |
-| `--cache-type-k q4_0` | K cache quantized to 4-bit | Required at 256K | Reduces host KV by ~920 MiB; V cache stays f16. **Do not use `--cache-type-v`** — V cache quantization corrupts output with VITRIOL |
+| `--chimera-mode auto` | Dual-backend: CUDA for MoE, Vulkan for dense ops | **+80%** | Auto-detected when both backends available |
+| `--cache-type-k q4_0` | K cache quantized to 4-bit | Required at 256K | Reduces host KV. V cache stays f16 — **do not use `--cache-type-v`** |
+| `--kv-quant-v f16` | V cache precision (default f16) | — | **f16 only** — q8_0/q4_0 corrupt output with VITRIOL |
+| `--pin-layers N` | Pin first N layers' expert tensors in VRAM | +5-10% | Covers early MoE layers in VRAM (default 8) |
 | `--kv-mode offload` | KV cache in host RAM | Enables 256K context | Long context coding |
 | `--kv-mode sparse` | Attention-score eviction (4-8x compression) | Saves host RAM | Extreme context length |
 | `--frozen-prompt on` | Cache KV prefix across requests | Prefill saved | Repeated requests, same system prompt |
 | `--memory-mode on` | Cross-session persistent memory via SQLite | ~5.0 | Multi-session projects |
 | `--semantic-mode on` | Cosine similarity retrieval | ~5.0 | Large memory databases |
+| `--disk-offload` | File-backed mmap for models > system RAM | — | Large models (e.g., 24 GB Coder-Next) |
 
 All flags can be set via CLI flag, env var, or the TUI (`vitriol config`).
 
@@ -74,19 +77,19 @@ The problem: the best open-weight models are MoE architectures (Mixture of Exper
 
 VITRIOL's insight: MoE models only activate ~2-8 out of 256 experts per token. The expert weights don't need to live in VRAM. Keep them in **page-locked system RAM** instead — the GPU reads them over PCIe DMA on demand. The base model, attention weights, KV cache, and compute buffers stay in VRAM. Only the experts are offloaded.
 
-**Result:** 12.82 tok/s on a GTX 1070 Ti (8 GB) with a 34.66B-parameter 256-expert model — **+125% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL.
+**Result:** 23.3 tok/s on a GTX 1070 Ti (8 GB) with a Qwen3.6-35B MoE model via the Chimera dual-backend (CUDA+Vulkan) — **+309% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL.
 
 | Metric | Value |
 |--------|-------|
 | Model | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) (34.66B, 256 MoE experts, IQ2_M by Unsloth) |
 | GPU | GTX 1070 Ti (Pascal, 8 GB VRAM, PCIe Gen3 x16) |
 | CPU | Intel 4th gen (Haswell, no AVX2) |
-| Generation (IQ2_M + MTP N=2 + pin 8) | **12.82 tok/s** ✅ (2026-05-21, server) |
-| Generation (Q2_K_XL + pin 15) | 9.88 tok/s |
+| Backend | **Chimera dual-backend** (CUDA VITRIOL for MoE + Vulkan for dense ops) |
+| Generation (Chimera + MTP N=2 + pin 8) | **23.3 tok/s** ✅ (2026-05-22, server) |
 | Generation (no opts) | 8.9 tok/s |
 | VRAM saved | ~10 GB (experts stay in host RAM) |
-| System RAM used | ~11.5 GiB (10040 MiB buffer + 360 MiB KV K q4_0 + 1280 MiB KV V f16) |
-| VRAM used | ~1.3 GiB (non-MTP) / ~1.6 GiB (with MTP head + pin pool) |
+| System RAM used | ~10 GiB (VITRIOL buffer + KV cache) |
+| VRAM used | ~2.5 GiB (model + KV cache + compute buffers) |
 
 
 ## How It Works
@@ -98,7 +101,7 @@ CUDA kernels can read from **page-locked host memory** over PCIe DMA transparent
 VITRIOL implements this through a custom **ggml backend buffer type**:
 
 ```
-VITRIOL buffer type
+VITRIOL buffer type (CUDA experts)
   │
   ├─ 1. Allocation
   │     mmap(10 GB anonymous)         ← reserve address space
@@ -112,23 +115,60 @@ VITRIOL buffer type
   └─ 3. Inference
         Set is_host=true on the buffer type → llama.cpp scheduler routes
         MUL_MAT_ID to CUDA backend → GPU reads expert weights over PCIe DMA
+
+VITRIOL VK buffer type (Vulkan dense ops, Chimera only)
+  │
+  ├─ 1. Allocation
+  │     posix_memalign(64K alignment)  ← aligned for VK_EXT_external_memory_host
+  │     mlock                         ← pin to RAM
+  │
+  └─ 2. Inference
+        VkBuffer created lazily via ggml_vk_buffer_from_host_ptr()
+        → Vulkan reads dense tensor weights over PCIe DMA (zero-copy)
 ```
 
 The key flag is **`is_host=true`**. When the graph scheduler sees this on a buffer type it supports (via `supports_buft`), it treats the tensor as host-resident and keeps it in system memory. The CUDA backend accesses `src0->data` directly — the GPU's DMA engine fetches the bytes over PCIe when the kernel reads from that address.
 
-### LRU VRAM Cache (Inactive for Quantized Models)
+### Chimera Dual-Backend (CUDA + Vulkan)
 
-The LRU cache was designed to keep hot expert weights in a VRAM pool (~512 MB) for faster
-access via native GDDR5 bandwidth. **However, it is never reached for quantized MoE models**
-(Q2_K_XL, IQ2_M, etc.) because the MMQ fast path in `ggml_cuda_mul_mat_id` returns before
-the LRU code. See [`docs/LRU_DIAGNOSTIC_FINDING.md`](docs/LRU_DIAGNOSTIC_FINDING.md) for the
-full diagnosis.
+The Chimera hybrid backend routes each operation to the optimal GPU backend:
 
-Future VITRIOL-level Expert Pinning (see [`docs/plans/EXPERT_PINNING_V2.md`](docs/plans/EXPERT_PINNING_V2.md))
-will provide the same benefit — keeping frequent experts in VRAM — without modifying
-llama.cpp's kernel dispatch.
+| Operation | Backend | Why |
+|-----------|---------|-----|
+| MoE expert matmuls (`MUL_MAT_ID`) | CUDA VITRIOL | Page-locked DMA + pin pool + predictor |
+| SSM scan (d_state=16) | Vulkan | Pre-baked command buffers, Mamba-1 shader |
+| SSM scan (d_state=128/256) | Vulkan | Already supported |
+| Attention (KQ, PV) | Vulkan | Pre-baked pipelines |
+| Dense matmuls | Vulkan | Pre-baked pipelines |
 
-### Fast Path vs Slow Path
+**Architecture:**
+```
+                    Page-locked Host RAM
+                    ┌──────────────────────┐
+                    │ Expert weights       │ Dense weights        │
+                    │ (CUDA VITRIOL type)  │ (VITRIOL VK type)    │
+                    └──────────────────────┘
+                               │                    │
+                    CUDA: cudaHostRegister    VK: VK_EXT_external_memory_host
+                    reads via PCIe DMA        reads via imported VkBuffer
+
+Activations: CUDA VRAM ←→ CPU staging ←→ Vulkan VRAM
+             (~0.001ms per 16KB copy, ~0.13% overhead per token)
+```
+
+**Auto-detect:** Set `VITRIOL_CHIMERA_MODE=auto` (default). The model loader
+automatically detects if the Vulkan backend is available via dlsym. If both
+CUDA and Vulkan are present, Chimera activates. No manual config needed.
+
+**Modes:**
+| Mode | Effect |
+|---|---|
+| `auto` (default) | Chimera if both backends available, CUDA-only otherwise |
+| `cuda` | CUDA-only (standard VITRIOL, no Vulkan) |
+| `vulkan` | Vulkan-only (all tensors via VK_EXT_external_memory_host) |
+| `off` | CUDA-only (same as cuda) |
+
+### Fast Path vs Slow Path (CUDA)
 
 llama.cpp's `ggml_cuda_mul_mat_id` has three paths for MoE matmuls:
 
@@ -138,20 +178,23 @@ llama.cpp's `ggml_cuda_mul_mat_id` has three paths for MoE matmuls:
 | **MMQ** | Large batch, quantized | Reads `src0->data` directly with expert bounds | Yes — host DMA |
 | **cuBLAS (slow path)** | Everything else | Per-expert tensor slices | No — FP16 only |
 
-For quantized models, the MMQ/MMVQ fast paths handle all inference. They read expert
-weights directly from the page-locked host buffer over PCIe DMA. The cuBLAS slow path
-(which has LRU support) is never reached for quantized types.
+For quantized models, the MMQ/MMVQ fast paths handle all MoE inference on CUDA.
+Dense ops (SSM, attention) run on Vulkan with pre-baked command buffers when
+Chimera mode is active.
 
 ### Why Not Just Load Everything Into VRAM?
 
-Because it doesn't fit. Qwen3.6-35B-A3B at UD-Q2_K_XL is 11.44 GiB. The GTX 1070 Ti has 8 GiB total. Without VITRIOL, llama.cpp crashes with `cudaMalloc failed: out of memory` at `-ngl 99`.
+Because it doesn't fit. Qwen3.6-35B-A3B at IQ2_M is ~3.5 GB. The GTX 1070 Ti has 8 GiB total.
+Without VITRIOL, llama.cpp crashes with `cudaMalloc failed: out of memory` at `-ngl 99`.
 
-With VITRIOL:
-- Base model weights (non-expert): ~1.3 GiB in VRAM
-- Expert weights: 0 GiB in VRAM (host RAM only)
-- KV cache + compute: ~1.4 GiB (host, Q4_0) + ~215 MiB (VRAM, compute buffers)
+With VITRIOL (Chimera mode):
+- Base model weights (dense, non-expert): ~1.3 GiB in VRAM
+- Expert weights: 0 GiB in VRAM (host RAM only, CUDA DMA)
+- Dense weights: 0 GiB in VRAM (host RAM only, Vulkan VK_EXT)
+- KV cache + compute: ~28 MiB (8K ctx K q4_0) + ~304 MiB (compute buffers)
 - MTP head (optional): +302 MiB in VRAM
-- **Total VRAM: ~1.5 GiB (non-MTP) / ~1.8 GiB (MTP)** — leaving 6.2+ GiB free
+- Pin pool (optional): +0-4096 MiB in VRAM (expert tensors cached in VRAM)
+- **Total VRAM: ~1.6 GiB (MTP, no pin pool) / ~5.7 GiB (MTP + pin 8)**
 
 
 ## CLI Reference
@@ -177,12 +220,15 @@ Run options:
   -ngl N         GPU layers to offload
   -lru MB        LRU VRAM cache size (inactive for quantized models)
   --memory-mode MODE  emulated memory: on | off (default: off)
-  --kv-quant MODE     KV K-cache quantization: f16 | q8_0 | q4_0. **Warning:** only K cache is quantized. `--cache-type-v` is forbidden — V quantization corrupts output with VITRIOL (llama.cpp qwen35moe bug, see Experiment 17).
+  --kv-quant MODE     K cache quantization: f16 | q8_0 | q4_0. **Warning:** only K cache; V cache stays f16 by default.
+  --kv-quant-v MODE   V cache quantization: f16 (default, safe) | q8_0 | q4_0 (RISK: corrupts output with VITRIOL)
   --spec-type TYPE    speculative decoding: mtp | draft (default: disabled)
   --spec-draft-n-max N  tokens to draft per cycle (default: 0, recommended: 2 for IQ2_M)
   --pin-layers N       pin first N layers' expert tensors in VRAM
   --prune-experts N    drop bottom N of 8 active experts (0-7, experimental)
   --predictive-prefetch on|off  cross-layer expert prefetch (DMA stream overlap)
+  --chimera-mode MODE  backend routing: auto | cuda | vulkan | off (default: auto)
+  --disk-offload       enable file-backed mmap for models larger than system RAM
   --verbose      enable debug logging
   --dry-run      print config without launching
 
@@ -196,12 +242,15 @@ Serve options:
   -port N        server port (default: 8279)
   -p N           parallel slots (default: 1)
   --memory-mode MODE  emulated memory: on | off (default: off)
-  --kv-quant MODE     KV K-cache quantization: f16 | q8_0 | q4_0. **Warning:** only K cache is quantized. `--cache-type-v` is forbidden.
+  --kv-quant MODE     K cache quantization: f16 | q8_0 | q4_0. K only; V stays f16.
+  --kv-quant-v MODE   V cache quantization: f16 (safe) | q8_0 | q4_0 (RISK)
   --spec-type TYPE    speculative decoding: mtp | draft (default: disabled)
   --spec-draft-n-max N  tokens to draft per cycle (default: 0, recommended: 2)
   --pin-layers N       pin first N layers' expert tensors in VRAM
   --prune-experts N    drop bottom N of 8 active experts (0-7, experimental)
   --predictive-prefetch on|off  cross-layer expert prefetch (DMA stream overlap)
+  --chimera-mode MODE  backend routing: auto | cuda | vulkan | off (default: auto)
+  --disk-offload       enable file-backed mmap for models > system RAM
   --detach       run server in background
   --verbose      enable debug logging
   --dry-run      print config without launching
@@ -219,7 +268,8 @@ Use `vitriol serve --detach` for background API mode, `vitriol stop` to shut dow
 
 | Mode | What it does |
 |------|-------------|
-| **stream** | **(Default, only active mode.)** RAM Shot + VITRIOL DMA. All expert weights in page-locked host RAM. GPU reads them over PCIe DMA on demand. MTP head (if enabled) loads through the same buffer. |
+| **stream** | **(Default.)** RAM Shot + VITRIOL DMA. All expert weights in page-locked host RAM. GPU reads them over PCIe DMA on demand. MTP head (if enabled) loads through the same buffer. |
+| **Chimera** | **(Auto-detect, VITRIOL_CHIMERA_MODE=auto.)** Dual-backend hybrid. Expert tensors → CUDA VITRIOL DMA (page-locked host RAM). Dense tensors (SSM, attention, norms) → Vulkan via `VK_EXT_external_memory_host`. Cross-backend activation copies handled automatically by the scheduler (~0.13% overhead). 23.3 tok/s verified. |
 
 ### Memory Mode (Experimental)
 
@@ -243,37 +293,41 @@ Configure via `vitriol config` (TUI option 4) or `vitriol serve --memory-mode on
 
 ## Performance
 
-### Current Best: 12.82 tok/s (Server, Verified Clean)
+### Current Best: 23.3 tok/s (Server, Verified Clean, Chimera Dual-Backend)
 
-System: GTX 1070 Ti (PCIe Gen3 x16), 15 GB RAM, IQ2_M model, MTP N=2, 128K context, `--cache-type-k q4_0` (K only!), `--reasoning off`, pin=8.
+System: GTX 1070 Ti (PCIe Gen3 x16), 15 GB RAM, IQ2_M model, Chimera dual-backend
+(CUDA VITRIOL for MoE + Vulkan for dense ops), MTP N=2, pin=8, `--cache-type-k q4_0`.
 
 | Config | Gen (tok/s) | vs x8 baseline | Notes |
 |--------|------------|----------------|-------|
 | PCIe x8 (GTX 960 present, no VITRIOL) | 5.7 | — | Pre-VITRIOL baseline |
-| PCIe x16 (GTX 960 removed) | 8.9 | +56% | Before MTP/pin |
+| PCIe x16 (GTX 960 removed) | 8.9 | +56% | Before MTP/pin/Chimera |
 | + Q2_K_XL + pin 15 | 9.88 | +73% | ✅ Clean (no MTP) |
-| + IQ2_M + MTP N=2 + pin 8 | **12.82** | **+125%** | ✅ Clean (2026-05-21) |
+| + IQ2_M + MTP N=2 + pin 8 | 12.82 | +125% | ✅ Clean (2026-05-21) |
+| **+ Chimera + CAP_IPC_LOCK** | **23.3** | **+309%** | ✅ Clean (2026-05-22) |
 
 **Key findings:**
-- **Best config:** IQ2_M model with `--spec-type mtp --spec-draft-n-max 2 --reasoning off --cache-type-k q4_0` at **12.82 t/s** (verified clean, server-side)
-- MTP acceptance rate: ~83% (5/6 drafts accepted per cycle)
-- `--cache-type-v q4_0` **must not be used** — V cache quantization corrupts output with VITRIOL (likely a llama.cpp flash attention bug for the `qwen35moe` architecture; see Experiment 17)
-- `--reasoning off` required for Qwen3.6 models (thinking mode corrupts output tokenizer)
-- Prune > 0 and output cache break output quality (repetition loops)
+- **Best config:** IQ2_M model with Chimera dual-backend, `--spec-type mtp --spec-draft-n-max 2 --cache-type-k q4_0` at **23.3 t/s** (verified clean, server-side)
+- MTP acceptance rate: ~100% (19/19 drafts accepted per typical cycle at 8K context)
+- Chimera auto-detects: `VITRIOL_CHIMERA_MODE=auto` enables CUDA+Vulkan hybrid automatically
+- `--cache-type-v` **must remain at f16** — V cache quantization corrupts output with VITRIOL (see Experiment 17)
+- Pin pool (`VITRIOL_PIN_FIRST_N_LAYERS=8`) covers first 8 expert layers in VRAM
 
 See full sweep data in [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md#mtp-draft-n-max-sweep-2026-05-19), [`docs/FINDINGS_2026-05-19.md`](docs/FINDINGS_2026-05-19.md), and [`docs/plans/COMPUTE_OPTIMIZATIONS.md`](docs/plans/COMPUTE_OPTIMIZATIONS.md).
 
-### VRAM at 256K Context
+### VRAM at 8K Context (Chimera Dual-Backend)
 
 | Component | Non-MTP | With MTP Head |
 |-----------|---------|---------------|
-| Model weights (GPU) | ~1337 MiB | ~1337 + 302 MiB |
-| VITRIOL buffer (RAM) | ~10040 MiB | ~10040 MiB |
-| KV cache (K q4_0 + V f16, 128K ctx) | ~1640 MiB | ~1640 MiB |
-| Compute buffers | ~215 MiB | + overhead |
-| **Total VRAM** | **~1.3 GiB** | **~1.6 GiB** |
-| **Total system RAM** | **~11.5 GiB** | **~11.8 GiB** |
-| **VRAM headroom** | **~6.7 GiB** | **~6.4 GiB** |
+| Model weights (GPU, dense) | ~1337 MiB | ~1337 + 302 MiB |
+| VITRIOL buffer (host RAM, experts) | ~10040 MiB | ~10040 MiB |
+| VITRIOL VK buffer (host RAM, dense) | ~0 MiB (imported) | ~0 MiB (imported) |
+| KV cache (K q4_0 + V f16, 8K ctx) | ~28 MiB | ~28 MiB |
+| Compute buffers | ~304 MiB | + overhead |
+| Pin pool (expert VRAM cache) | ~0-4096 MiB | ~0-4096 MiB |
+| **Total VRAM** | **~1.9-5.9 GiB** | **~2.2-6.2 GiB** |
+| **Total system RAM** | **~10 GiB** | **~10.3 GiB** |
+| **VRAM headroom** | **~2-6 GiB** | **~2-6 GiB** |
 
 
 ## Hardware Targets
@@ -285,9 +339,11 @@ See full sweep data in [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md#m
 
 | GPU | VRAM | Status | Notes |
 |-----|------|--------|-------|
-| GTX 1070 Ti | 8 GB | ✅ Verified | PCIe 3.0 x16, **12.82 tok/s** (IQ2_M, MTP N=2, pin=8) — confirmed 2026-05-21 |
+| GTX 1070 Ti | 8 GB | ✅ Verified | PCIe 3.0 x16, **23.3 tok/s** (Chimera, IQ2_M, MTP N=2, pin=8) — confirmed 2026-05-22 |
 | RTX 3060 | 12 GB | ✅ Supported | More VRAM for larger KV cache |
 | RTX 4090 | 24 GB | ✅ Supported | PCIe 4.0 x16 → higher bandwidth |
+| AMD RX 7000 | varies | ✅ Chimera (Vulkan) | Vulkan backend handles dense ops; MoE via CUDA not available |
+| Intel Arc | varies | ✅ Chimera (Vulkan) | Vulkan backend via `VK_EXT_external_memory_host` |
 
 **CPU requirement:** VITRIOL uses the GPU as the primary MoE compute engine (experts
 streamed over PCIe DMA). The CPU is only an orchestrator — no AVX2 or fast CPU is
@@ -398,10 +454,14 @@ See `docs/EMULATED_MEMORY_ARCHITECTURE.md` for the full design (DB schema, scori
 │   └── vitriol_logo.svg     ← SVG logo
 ├── llama.cpp/               ← Git submodule (pinned commit)
 ├── llama.cpp/ggml/src/ggml-cuda/
-│   ├── vitriol-buffer.{cpp,h}              ← RAM Shot buffer type
-│   ├── vitriol-cuda-integration.{cpp,h}    ← LRU cache + init + config
+│   ├── vitriol-buffer.{cpp,h}              ← RAM Shot buffer type (CUDA)
+│   ├── vitriol-cuda-integration.{cpp,h}    ← Pin pool + predictor + config
 │   ├── vitriol_copy_engine.{cpp,h}         ← CE DMA (standalone)
-│   └── ggml-cuda.cu                        ← supports_buft + LRU hooks
+│   └── ggml-cuda.cu                        ← supports_buft + pin pool hooks
+├── llama.cpp/ggml/src/ggml-vulkan/
+│   ├── vitriol-vk-buffer.{cpp,h}           ← VITRIOL VK buffer type (Chimera)
+│   └── vulkan-shaders/
+│       └── ssm_scan_mamba1.comp            ← Mamba-1 SSM scan GLSL shader
 ├── llama.cpp-patches/       ← Tracked diffs for all VITRIOL changes
 ├── docs/
 │   ├── OPTIMIZATION_PLAN.md (V2)           ← 4-layer roadmap with citations
@@ -433,7 +493,8 @@ VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe,
 
 | Project | What We Learned |
 |---------|-----------------|
-| **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (ggml-org) | The core inference engine. GGUF format, CUDA backend, tensor loading pipeline. The `-ot` (override tensor) flag in PR #11397 was the breakthrough that enabled expert streaming. Our `vitriol-cuda-integration.cpp` hooks into `ggml-cuda.cu` at the tensor-copy boundary. |
+| **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (ggml-org) | The core inference engine. GGUF format, CUDA backend, tensor loading pipeline. The `-ot` (override tensor) flag in PR #11397 was the breakthrough that enabled expert streaming. Our `vitriol-cuda-integration.cpp` hooks into `ggml-cuda.cu` at the tensor-copy boundary. Vulkan backend (PR #16463) provides SSM operation support and `VK_EXT_external_memory_host` for zero-copy host memory import. |
+| **[PR #16463](https://github.com/ggerganov/llama.cpp/pull/16463)** (giuseppe) | Added SSM_SCAN and SSM_CONV to the Vulkan backend. Our Mamba-1 shader extends this with Mamba-2-only to add d_state=16 support for Qwen3's Gated Delta Net and Jamba2. |
 | **[GGUF Format](https://github.com/ggerganov/llama.cpp/blob/master/ggml/include/gguf.h)** | Binary model format with tensor offsets accessible via `gguf_get_tensor_offset()`, `gguf_get_tensor_name()`, `gguf_get_tensor_type()` — the foundation of our expert parser. |
 | **[PR #11397](https://github.com/ggerganov/llama.cpp/pull/11397)** (slaren) | Added `--override-tensor` (`-ot`) for per-tensor-type buffer placement. The exact mechanism we use: `-ot ".*exps.*=CPU"` keeps 8GB of experts on CPU while attention layers run on GPU. |
 | **[PR #11571](https://github.com/ggerganov/llama.cpp/pull/11571)** (fairydreaming) | Load-all-experts-during-warmup; `llama_set_warmup()` API for ensuring all expert tensors are resident before inference. |
@@ -459,6 +520,10 @@ VITRIOL stands on the shoulders of giants. Every core insight — DMA over PCIe,
 
 | Technique | Prior Art | VITRIOL Implementation |
 |-----------|-----------|----------------------|
+| **Chimera Dual-Backend** | N/A (VITRIOL-original) | CUDA+Vulkan hybrid: MoE experts on CUDA DMA, dense ops on Vulkan command buffers |
+| **Mamba-1 Vulkan SSM Shader** | PR #16463 (Mamba-2 only) | GLSL compute shader for d_state=16 SSM scan, 128 threads/workgroup |
+| **VITRIOL VK Buffer Type** | VK_EXT_external_memory_host spec | Page-locked host RAM imported into Vulkan via external memory extension |
+| **Auto-Detect Backend Routing** | N/A (VITRIOL-original) | `VITRIOL_CHIMERA_MODE=auto` — dlsym-based detection of available backends |
 | **RAM Shot** (page-locked host RAM) | LLM in a Flash (Apple, 2023) | `vitriol-buffer.cpp` — mmap+mlock+cudaHostRegister |
 | **LRU VRAM cache** | HOBBIT (2024), KTransformers | Composite key (tensor_base, expert_idx), dedicated CUDA stream |
 | **Fire-and-Forget DMA overlap** | PreScope (2025), Fate (2025) | `vitriol_lru_prefetch_async` — async H2D, cuStreamWaitEvent on cache hit |

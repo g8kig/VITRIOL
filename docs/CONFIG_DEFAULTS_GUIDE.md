@@ -226,6 +226,33 @@ Disk offload replaces the anonymous 10 GB VITRIOL buffer with a file-backed mmap
 | 8-12 GB RAM | `--disk-offload` | Avoid OOM kills |
 | Running other memory-heavy apps alongside | `--disk-offload` | Free RAM for other processes |
 
+### Chimera Dual-Backend Mode
+
+The Chimera hybrid (default `auto`) routes MoE experts to CUDA VITRIOL DMA
+and dense ops (SSM scan, attention, norms) to Vulkan. Enabled automatically
+when both CUDA and Vulkan backends are present.
+
+**Why the split:**
+- MoE expert matmuls benefit from VITRIOL's page-locked DMA + pin pool + predictor
+- Dense ops benefit from Vulkan's pre-baked command buffers (lower CPU overhead)
+- Cross-backend activation copies are automatic via CPU staging (~0.13% overhead)
+
+**Detection:** `dlsym(RTLD_DEFAULT, "vitriol_get_vk_buffer_type")` — if found
+in `libggml-vulkan.so`, Chimera activates. No user intervention needed.
+
+### V Cache Quantization (Default: f16)
+
+The V cache must remain at f16 precision. `--cache-type-v q4_0` or `q8_0`
+produces garbage output with VITRIOL's expert buffer type. This is a known
+interaction between VITRIOL's buffer type and llama.cpp's flash attention
+for the `qwen35moe` architecture (see EXPERIMENT_LOG.md Experiment 17).
+
+```ini
+[kv]
+quant_mode = q4_0    # K cache: 4-bit (safe, recommended)
+quant_mode_v = f16   # V cache: f16 ONLY (do not change)
+```
+
 ---
 
 ## Putting It All Together

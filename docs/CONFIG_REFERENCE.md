@@ -150,6 +150,31 @@ VITRIOL_PREDICTIVE_PREFETCH=1 vitriol serve --detach \
 # 4.5-5.0 tok/s, 20K+ context, persistent memory, semantic search, prefetch, cached prefill
 ```
 
+### Chimera dual-backend (max throughput)
+
+```bash
+vitriol serve --detach --chimera-mode auto --spec-type mtp --spec-draft-n-max 2 --pin-layers 8
+# 23.3 tok/s, CUDA+Vulkan hybrid, expert MoE on CUDA, dense ops on Vulkan
+# Auto-detected when both backends available (default)
+```
+
+### Chimera tuning
+
+| Flag | Options | Effect |
+|------|---------|--------|
+| `--chimera-mode` | auto, cuda, vulkan, off | Backend routing mode |
+| `--pin-layers N` | 0-32 | Expert tensors cached in VRAM (default 8) |
+| `--predictive-prefetch` | on, off | Overlap expert DMA with compute |
+
+### V cache quantization (advanced, risky)
+
+**⚠️ WARNING:** Setting `--kv-quant-v` to `q8_0` or `q4_0` may produce garbage output
+with VITRIOL expert offloading. The `--cache-type-v` flag corrupts output due to an
+interaction between VITRIOL's buffer type and llama.cpp's flash attention for the
+qwen35moe architecture (see EXPERIMENT_LOG.md Experiment 17).
+
+Default: `f16` (safe). Only change if you have verified it works with your model.
+
 ---
 
 ## Cost-Benefit Quick Reference

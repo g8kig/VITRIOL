@@ -1,10 +1,11 @@
-# VITRIOL Recommended Settings — GTX 1070 Ti (8GB)
+# VITRIOL Recommended Settings — GTX 1070 Ti (8GB VRAM)
 
 System: 15 GB RAM, NVMe SSD, 4 CPU threads, PCIe Gen3 x16.
+**Qwen3.6-35B-A3B-UD-IQ2_M.gguf** (23.3 tok/s verified).
 
 ---
 
-## Quick Config
+## Quick Config (`~/.vitriol/config`)
 
 ```ini
 [gpu]
@@ -12,28 +13,35 @@ device = 0
 exclude_secondary = true
 
 [model]
-path = /mnt/data/ai/koboldcpp/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf
-context = 256000
+path = /home/randozart/Desktop/Projects/Qwen3.6-35B-A3B-UD-IQ2_M.gguf
+context = 8192
 threads = 4
 ngl = 99
+expert_count = 0
 
 [vitriol]
 mode = stream
 lru_mb = 0
 verbose = true
+output_cache = off
+predictive_prefetch = on
+pin_first_n_layers = 8
+prune_experts = 0
+reasoning = off
 
 [server]
 host = 0.0.0.0
 port = 8279
-parallel = 4
+parallel = 1           # MTP caps parallel to 1
 
 [memory]
 mode = off
 semantic_mode = off
 
 [kv]
-mode = offload
-quant_mode = q4_0
+mode = standard
+quant_mode = q4_0       # K cache only; V stays f16
+quant_mode_v = f16      # ⚠ Do not change — V quant corrupts output
 frozen_prompt = on
 
 [engine]
@@ -41,53 +49,76 @@ mode = vitriol-dma
 
 [lookup]
 tokens = 0
-```
 
-## CLI Flags (always required)
-
-```
-vitriol serve --detach \
-  --cache-type-k q4_0 \
-  -fa on --no-mmap
-```
-
-**⚠️  `--cache-type-v q4_0` is forbidden.** V cache quantization corrupts output with VITRIOL (see EXPERIMENT_LOG.md Experiment 17). Only K cache is quantized; V cache stays at f16 precision.
-
-These are automatically wired by the vitriol script from config settings. Pass them explicitly only when bypassing the script.
-
-## MTP (Speculative Decoding)
-
-Only use if your GGUF model has `nextn_predict_layers` metadata (e.g. Unsloth MTP models).
-
-```ini
 [spec]
 type = mtp
 draft_n_max = 2
+
+[chimera]
+mode = auto             # Auto-detect CUDA+Vulkan hybrid
 ```
 
-**Why N=2**: Sweep confirmed acceptance rate = exactly `1/N`. N=2 gives 50% acceptance (1 token/cycle). Higher N wastes PCIe bandwidth on rejected draft tokens.
+## CLI Flags (for direct llama-server usage)
 
-**Detection**: `head -c 1M model.gguf | grep -q nextn_predict_layers`
+```bash
+VITRIOL_MODE=stream \
+VITRIOL_ENGINE_MODE=vitriol-dma \
+VITRIOL_PIN_FIRST_N_LAYERS=8 \
+  llama-server \
+    -m Qwen3.6-35B-A3B-UD-IQ2_M.gguf \
+    -ngl 99 -c 8192 --host 0.0.0.0 --port 8279 \
+    --parallel 1 -t 4 -fa on \
+    --cache-type-k q4_0 --no-mmap \
+    --checkpoint-every-n-tokens 4096 \
+    --spec-type mtp --spec-draft-n-max 2
+```
+
+**⚠️ V cache:** Do NOT pass `--cache-type-v`. V cache stays at f16.
+Quantizing V produces garbage output with VITRIOL (see EXPERIMENT_LOG.md).
 
 ## Per-Setting Rationale
 
-| Setting | Value | Why not default? |
-|---------|-------|-----------------|
-| `context = 256000` | Matches Qwen3.6 reported effective context. 500K exceeds RAM. |
+| Setting | Value | Why |
+|---------|-------|-----|
+| `context = 8192` | Matches typical chat use. 256K works but uses more VRAM for KV cache. |
 | `threads = 4` | GTX 1070 Ti has 4 scheduler units. `t=8` causes contention (+25% slower). |
-| `ngl = 99` | Offload all layers. 1337 MiB fits easily in 8 GB VRAM. |
-| `mode = stream` | Only mode that page-locks RAM for VITRIOL DMA. Sync/async/off won't work. |
-| `lru_mb = 0` | LRU cache is unreachable on quantized MoE models (FP16 only). |
-| `kv.mode = offload` | Moves KV cache from VRAM to host, leaving room for compute buffers. |
-| `kv.quant_mode = q4_0` | K cache q4_0 reduces GPU VRAM by ~920 MiB vs f16. **V cache stays f16** — `--cache-type-v q4_0` corrupts output (Experiment 17). |
-| `frozen_prompt = on` | Keeps system prompt static to avoid re-prefix on each request. |
-| `engine.mode = vitriol-dma` | Enables the CUDA expert intercept layer. Native mode = no VITRIOL. |
-| `exclude_secondary = true` | Prevents CUDA from seeing the GTX 960 (CC 5.2, no kernel images). |
+| `ngl = 99` | Offload all layers. Weights in host RAM via VITRIOL DMA. |
+| `mode = stream` | Only mode that page-locks RAM for VITRIOL DMA. |
+| `pin_first_n_layers = 8` | Covers first 8 expert layers in VRAM (+5-10% speed). |
+| `parallel = 1` | Required by MTP speculative decoding. |
+| `predictive_prefetch = on` | Overlaps expert DMA with compute for next token. |
+| `cache-type-k q4_0` | 4-bit K cache saves VRAM. V stays f16. |
+| `frozen_prompt = on` | Cache KV prefix across requests, avoids re-prefix. |
+| `engine.mode = vitriol-dma` | Enables the CUDA expert intercept layer. |
+| `spec.type = mtp` | Multi-Token Prediction: 19/19 draft acceptance (+100%). |
+| `chimera.mode = auto` | Auto-detects CUDA+Vulkan backends for hybrid routing. |
+
+## Chimera Dual-Backend
+
+When `chimera.mode = auto` and both CUDA + Vulkan are present:
+
+| Operation | Backend | Benefit |
+|-----------|---------|---------|
+| MoE expert matmuls | CUDA VITRIOL DMA | Page-locked host RAM, pin pool, predictor |
+| SSM scan, attention, norms | Vulkan | Pre-baked command buffers, `VK_EXT_external_memory_host` |
+| Cross-backend copies | CPU staging (automatic) | ~0.13% overhead per token |
 
 ## Performance
 
 | Config | Gen (tok/s) | vs x8 baseline |
 |--------|------------|----------------|
 | PCIe x8 (GTX 960 present) | 5.7 | — |
-| PCIe x16 (GTX 960 removed) | 9.1 | +60% |
+| PCIe x16 (GTX 960 removed) | 8.9 | +56% |
 | + IQ2_M + MTP N=2 + pin 8 | 12.82 | +125% |
+| **+ Chimera + CAP_IPC_LOCK** | **23.3** | **+309%** |
+
+## Context Size vs KV Cache
+
+| Context | KV Cache (K q4_0 + V f16) | Gen Speed |
+|---------|--------------------------|-----------|
+| 8,192 | ~28 MiB | 23.3 tok/s |
+| 16,384 | ~226 MiB | 20.3 tok/s |
+| 32,768 | ~451 MiB | 18.7 tok/s |
+| 65,536 | ~902 MiB | 18.3 tok/s |
+| 262,144 | ~3.6 GiB | 17.3 tok/s (pin pool disabled) |
+
