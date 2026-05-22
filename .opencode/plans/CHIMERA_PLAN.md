@@ -1,18 +1,19 @@
 # VITRIOL Chimera: CUDA + Vulkan Hybrid Backend — Milestone Plan
-**Date:** 2026-05-22 10:30
+**Date:** 2026-05-22 10:30 (updated 2026-05-22 11:00)
 **Author:** VITRIOL Project
-**Status:** Milestone 1 Complete, Milestones 2-4 Planned
+**Status:** Milestone 1 Complete, Milestone 2 In Progress
 
 ---
 
 ## Table of Contents
 1. [The Chimera Architecture](#1-the-chimera-architecture)
-2. [Milestone 1: Mamba-1 Vulkan SSM Shader ✅](#2-milestone-1-mamba-1-vulkan-ssm-shader-)
-3. [Milestone 2: VITRIOL Memory → Vulkan](#3-milestone-2-vitriol-memory--vulkan)
-4. [Milestone 3: Dynamic MoE Command Buffers](#4-milestone-3-dynamic-moe-command-buffers)
-5. [Milestone 4: Backend Routing](#5-milestone-4-backend-routing)
-6. [Testing Strategy](#6-testing-strategy)
-7. [File Inventory](#7-file-inventory)
+2. [Option B: Full Dual-Backend Chimera](#2-option-b-full-dual-backend-chimera)
+3. [Milestone 1: Mamba-1 Vulkan SSM Shader ✅](#3-milestone-1-mamba-1-vulkan-ssm-shader-)
+4. [Milestone 2: VITRIOL Memory → Vulkan](#4-milestone-2-vitriol-memory--vulkan)
+5. [Milestone 3: Dynamic MoE Command Buffers](#5-milestone-3-dynamic-moe-command-buffers)
+6. [Milestone 4: Backend Routing](#6-milestone-4-backend-routing)
+7. [Testing Strategy](#7-testing-strategy)
+8. [File Inventory](#8-file-inventory)
 
 ---
 
@@ -27,7 +28,22 @@ VITRIOL's current solution — page-locked host RAM + CUDA DMA — works well fo
 - LRU cache + predictive prefetch have bugs (output corruption)
 - CUDA-only, no AMD/Intel support
 
-The Chimera combines:
+### 1.2 Option A vs Option B
+
+| Aspect | Option A: Vulkan Only | Option B: Full Chimera |
+|---|---|---|
+| MoE experts | Vulkan MUL_MAT_ID (unproven speed) | CUDA VITRIOL (proven 23.5 tok/s) |
+| Dense ops (SSM, attn) | Vulkan (pre-baked cmd buffers) | Vulkan (pre-baked cmd buffers) |
+| Cross-backend overhead | None (single backend) | ~0.13% (CPU staging copies) |
+| Cross-vendor | AMD + Intel + NVIDIA | MoE: NVIDIA only; Dense: any |
+| Complexity | Lower | Medium |
+| Max speed | Unknown | Likely highest |
+
+### 1.3 Decision: Option B (Full Chimera)
+
+Selected for maximum speed. The cross-backend overhead (CPU staging copies for
+activations between CUDA and Vulkan VRAM) is ~0.001 ms per copy at 16 KB each,
+or ~0.056 ms per token total — essentially free.
 - **CUDA VITRIOL** for MoE expert matmuls (where VITRIOL's DMA + predictor excel)
 - **Vulkan** for dense ops (SSM scan, attention, norms) where pre-baked command buffers reduce CPU overhead
 
@@ -128,7 +144,7 @@ For each head (128 heads per workgroup, 1 head per thread):
 
 ## 3. Milestone 2: VITRIOL Memory → Vulkan
 
-**Status: Planned** — ~250 lines, 2-3 days
+**Status: In Progress** — Implementation started 2026-05-22 11:00
 
 ### 3.1 Goal
 
@@ -137,21 +153,9 @@ into Vulkan via `VK_EXT_external_memory_host`. Currently, `-ngl 99` on Vulkan fa
 with `vk::Device::allocateMemory: ErrorOutOfDeviceMemory` because all weights try to
 fit in VRAM.
 
-### 3.2 Architecture
+### 3.2 Implementation Plan
 
-```
-VITRIOL Allocator (mmap + mlock + cudaHostRegister)
-  │
-  ├─→ CUDA: cudaHostGetDevicePointer (already exists)
-  │     Used for: expert tensors (MUL_MAT_ID via VITRIOL pin pool)
-  │
-  └─→ Vulkan: ggml_vk_buffer_from_host_ptr() (needs integration)
-        Used for: dense tensors (SSM scan, attention, norms via Vulkan cmd buffers)
-```
-
-### 3.3 Implementation Plan
-
-#### Step 1: Shared Host Memory Allocator (~50 lines)
+#### Step 1: Shared Host Memory Allocator (~80 lines)
 
 **Files:** `vitriol-allocator.h` (new), `vitriol-allocator.cpp` (new)
 
@@ -160,9 +164,9 @@ Extract the allocation logic from `vitriol-buffer.cpp` into a shared allocator:
 ```cpp
 // vitriol-allocator.h
 struct vitriol_allocator {
-    void * ptr;     // mmap'd base
-    size_t size;    // total size
-    size_t used;    // current offset
+    void * ptr;
+    size_t size;
+    size_t used;
 };
 
 vitriol_allocator * vitriol_allocator_create(size_t size);
@@ -171,56 +175,70 @@ void * vitriol_allocator_alloc(vitriol_allocator * alloc, size_t size, size_t al
 ```
 
 The allocator:
-1. Creates anonymous hugepage-backed mmap (same as current `vitriol-buffer.cpp:207-208`)
+1. Creates anonymous hugepage-backed mmap (same as `vitriol-buffer.cpp:207-208`)
 2. Touches pages, sets MADV_HUGEPAGE, mlock (same as lines 218-226)
 3. Registers with cudaHostRegister for CUDA DMA (same as line 231)
-4. Tracks allocations via bump-pointer
+4. Tracks allocations via bump-pointer aligned to `minImportedHostPointerAlignment`
 
-#### Step 2: VITRIOL Vulkan Buffer Type (~80 lines)
+#### Step 2: VITRIOL Vulkan Buffer Type (~120 lines)
 
-**Files:** `vitriol-vk-buffer.cpp` (new), `vitriol-buffer.h` (modify)
+**Files:** `vitriol-vk-buffer.h` (new), `vitriol-vk-buffer.cpp` (new)
 
-New buffer type `vitriol_buffer_vk`:
+New buffer type `vitriol_buffer_vk` that:
+1. Allocates from the shared host allocator (same page-locked RAM as CUDA type)
+2. Imports each tensor's host RAM slice into Vulkan via `ggml_vk_buffer_from_host_ptr()`
+3. Stores the resulting `vk_buffer` alongside the host pointer in its context
+4. Reports `is_host = false` (so Vulkan accepts it for compute dispatch)
 
 ```cpp
-static bool vitriol_vk_buffer_type_init_tensor(
+static void * vitriol_vk_buffer_type_init_tensor(
     ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
-    // Allocate from shared host allocator
-    auto * ctx = (vitriol_buffer_context *)buffer->context;
+    auto * ctx = (vitriol_vk_buffer_context *)buffer->context;
     size_t size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
     size_t alignment = vitriol_vk_buffer_type_get_alignment(buffer->buft);
     tensor->data = vitriol_allocator_alloc(ctx->alloc, size, alignment);
-    // Create Vulkan buffer wrapping the same host pointer
     ctx->vk_buf = ggml_vk_buffer_from_host_ptr(
         ctx->vk_device, tensor->data, size);
-    return true;
+    return tensor->data;
 }
 ```
 
-Key differences from the CUDA VITRIOL buffer type:
-- Reports `is_host = false` (so Vulkan accepts it for compute)
-- Stores a `vk_buffer` alongside the host pointer
-- `cudaHostRegister` is done at the allocator level, not per-buffer
-
-#### Step 3: Modify `ggml_vk_tensor_subbuffer` to Handle VITRIOL Buffers (~30 lines)
+#### Step 3: Modify Vulkan `supports_buft` (~5 lines)
 
 **File:** `ggml-vulkan.cpp`
 
-Current code at line 6537 casts `tensor->buffer->context` to
-`ggml_backend_vk_buffer_context *`. VITRIOL's VK buffer type has a different context.
-We add a type check:
+Add VITRIOL VK buffer type check to `ggml_backend_vk_device_supports_buft`:
+
+```cpp
+static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    // Existing check
+    if (buft->iface.get_name == ggml_backend_vk_buffer_type_name) {
+        ggml_backend_vk_device_context * ctx = ...;
+        ggml_backend_vk_buffer_type_context * buft_ctx = ...;
+        return buft_ctx->device->idx == ctx->device;
+    }
+    // NEW: accept VITRIOL VK buffer types
+    if (vitriol_is_vitriol_vk_buffer_type(buft)) {
+        return true;
+    }
+    return false;
+}
+```
+
+#### Step 4: Modify `ggml_vk_tensor_subbuffer` (~30 lines)
+
+**File:** `ggml-vulkan.cpp`
+
+Currently line 6537 casts `tensor->buffer->context` to `ggml_backend_vk_buffer_context *`.
+VITRIOL VK buffer type has a different context. Add a type check:
 
 ```cpp
 static vk_subbuffer ggml_vk_tensor_subbuffer(...) {
     vk_buffer buffer = nullptr;
     size_t offset = 0;
-
-    if (ctx->device->uma) {
-        ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
-    }
+    if (ctx->device->uma) { ... }
     if (!buffer) {
-        // Check for VITRIOL VK buffer type first
-        if (vitriol_is_vitriol_vk_buffer(tensor->buffer->buft)) {
+        if (vitriol_is_vitriol_vk_buffer_type(tensor->buffer->buft)) {
             auto * vk_ctx = (vitriol_vk_buffer_context *)tensor->buffer->context;
             buffer = vk_ctx->vk_buf;
             offset = vk_tensor_offset(tensor) + tensor->view_offs;
@@ -230,16 +248,16 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(...) {
             offset = vk_tensor_offset(tensor) + tensor->view_offs;
         }
     }
-    GGML_ASSERT(buffer != nullptr);
     ...
 }
 ```
 
-#### Step 4: Route Tensors to Correct Buffer Type (~50 lines)
+#### Step 5: Model Loader Routing (~30 lines)
 
 **File:** `llama-model-loader.cpp`
 
-Modify the VITRIOL tensor interception code (lines 1187-1220):
+Extend the VITRIOL tensor interception code (lines 1187-1220) to route non-expert
+tensors to the VITRIOL VK buffer type when Chimera mode is active:
 
 ```cpp
 if (!buft) {
@@ -247,31 +265,45 @@ if (!buft) {
     if (tensor_name.find("exps") != std::string::npos) {
         // Expert tensor → CUDA VITRIOL buffer (existing path)
         buft = vitriol_getter();
-    } else if (using_vulkan_backend()) {
-        // Dense tensor → VITRIOL VK buffer
+    } else if (vitriol_chimera_enabled()) {
+        // Dense tensor → VITRIOL VK buffer (new path)
         buft = vitriol_get_vk_buffer_type();
     }
 }
 ```
 
-### 3.4 Alignment Considerations
+#### Step 6: Cross-Backend Copy Path (automatic)
 
-`VK_EXT_external_memory_host` requires:
-- Pointer alignment: `minImportedHostPointerAlignment` (typically 64K-256K)
-- Size alignment: same
+No code changes needed. The existing `ggml_backend_tensor_copy` fallback chain
+(`ggml-backend.cpp:477-498`) handles CUDA↔Vulkan copies via CPU staging:
 
-VITRIOL's current `mmap` provides 4K-aligned pointers. We need to:
-1. Allocate extra padding to ensure 64K alignment of individual tensor offsets
-2. Or use `posix_memalign(64K, size)` instead of `mmap` for the allocator
+```cpp
+// Fallback path (auto-selected when cpy_tensor returns false):
+void * data = malloc(nbytes);
+ggml_backend_tensor_get(src, data, 0, nbytes);  // GPU VRAM → CPU
+ggml_backend_tensor_set(dst, data, 0, nbytes);  // CPU → other GPU VRAM
+free(data);
+```
 
-The allocator's bump pointer must align to `max(4096, minImportedHostPointerAlignment)`.
+~0.001 ms per 16 KB activation — negligible overhead.
 
-### 3.5 Graceful Degradation
+### 3.3 Alignment Considerations
 
-If `VK_EXT_external_memory_host` is not available:
-- VITRIOL VK buffer type falls back to regular Vulkan device memory
+`VK_EXT_external_memory_host` requires pointer alignment to
+`minImportedHostPointerAlignment` (typically 64K-256K). The shared allocator
+enforces this:
+
+```cpp
+size_t alignment = max(4096, (size_t)device->min_imported_host_pointer_alignment);
+posix_memalign(&ptr, alignment, size);
+```
+
+### 3.4 Graceful Degradation
+
+If `VK_EXT_external_memory_host` or a GPU-specific feature is unavailable:
+- VITRIOL VK buffer type falls back to regular Vulkan device memory allocation
 - Only partial offload (`-ngl < layers_that_fit_in_vram`) is possible
-- CPU fallback for remaining layers
+- CUDA VITRIOL path remains fully functional as fallback
 
 ---
 
