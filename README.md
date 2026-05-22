@@ -6,6 +6,9 @@
 
 *(Visit the Interior of the Earth, by Rectifying you will find the Hidden Stone)*
 
+## Why VITRIOL?
+
+If you will excuse the alchemical aesthetic, VITRIOL is my attempt at using every optimization possible to run modern AI models on old hardware that would have no business running them otherwise. I am talking here specifically about my old desktop PC with a narrow PCIe bus, an outdated GPU, a CPU without AVX2 instructions, so offloading isn't even practical. With those constraints in mind I had a simple question: Could I stream directly from system RAM to GPU. It took a while, but I managed through a solid direct memory access system and a custom copy engine. Every optimization I am doing now is really one big mad computer science experiment to make old hardware punch above its weight, and possibly introduce those optimizations for newer hardware. This means VITRIOL is not a stable repo in the slighest. Not yet at least. I am trying to use the latest papers and research on LLM inference to squeeze every bit of performance out of my silicon, and I hope this comes to your benefit as well.
 
 ## Quick Start
 
