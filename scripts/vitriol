@@ -20,7 +20,7 @@ CONFIG_DIR="${HOME}/.vitriol"
 CONFIG_FILE="${CONFIG_DIR}/config"
 
 # ── defaults ─────────────────────────────────────────────────────
-DEFAULT_MODEL="/mnt/data/ai/koboldcpp/Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf"
+DEFAULT_MODEL="/home/randozart/Desktop/Projects/Qwen3.6-35B-A3B-UD-IQ2_M.gguf"
 DEFAULT_CTX=262144
 DEFAULT_THREADS=4
 DEFAULT_NGL=99
@@ -46,7 +46,7 @@ DEFAULT_CHIMERA_MODE="auto"
 DEFAULT_EXPERT_COUNT=0
 DEFAULT_OUTPUT_CACHE="off"
 DEFAULT_PREDICTIVE_PREFETCH="off"
-DEFAULT_PIN_FIRST_N_LAYERS=0
+DEFAULT_PIN_FIRST_N_LAYERS=8
 DEFAULT_PRUNE_EXPERTS=0
 DEFAULT_REASONING="off"
 
@@ -1094,6 +1094,11 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
             OUTPUT_CACHE="off"
             echo "  → Output cache auto-disabled (pinning + output cache target different decode paths)"
         fi
+        # Auto-disable pin pool at large contexts to free VRAM for KV cache + MTP head
+        if [[ "${CTX:-8192}" -gt 65536 ]] && [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]]; then
+            echo "  → Pin layers auto-disabled (context ${CTX} > 64K — VRAM needed for KV cache)"
+            PIN_FIRST_N_LAYERS=0
+        fi
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
 
@@ -1151,7 +1156,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         echo "  Engine:      $ENGINE_MODE"
         [[ -n "$SPEC_TYPE" ]] && echo "  Spec Type:   $SPEC_TYPE"
         [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && echo "  Draft N-Max: $SPEC_DRAFT_N_MAX"
-        echo "  Chimera:     $CHIMERA_MODE"
+        echo "  Chimera:     ${CHIMERA_MODE:-auto}"
         [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && echo "  Pin Layers:  $PIN_FIRST_N_LAYERS (expert tensors in VRAM)"
         if [[ "${PRUNE_EXPERTS:-0}" -gt 0 ]]; then
             prune_keep=$((8 - PRUNE_EXPERTS))
@@ -1294,10 +1299,14 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         PREDICTIVE_PREFETCH="${CFG_PREDICTIVE_PREFETCH}"
         PIN_FIRST_N_LAYERS="${CLI_PIN_LAYERS:-${CFG_PIN_FIRST_N_LAYERS}}"
         PRUNE_EXPERTS="${CLI_PRUNE_EXPERTS:-${CFG_PRUNE_EXPERTS}}"
-        # Auto-disable output cache when pinning is active
+        # Auto-disable output cache when pinning is active (1)
         if [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && [[ "$OUTPUT_CACHE" == "on" ]]; then
             OUTPUT_CACHE="off"
             echo "  → Output cache auto-disabled (pinning + output cache target different decode paths)"
+        fi
+        if [[ "${CTX:-8192}" -gt 65536 ]] && [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]]; then
+            echo "  → Pin layers auto-disabled (context ${CTX} > 64K — VRAM needed for KV cache)"
+            PIN_FIRST_N_LAYERS=0
         fi
         VERBOSE="${CLI_VERBOSE:-${CFG_VERBOSE}}"
         DEVICE="${CFG_DEVICE}"
@@ -1351,7 +1360,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         echo "  Engine:      $ENGINE_MODE"
         [[ -n "$SPEC_TYPE" ]] && echo "  Spec Type:   $SPEC_TYPE"
         [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && echo "  Draft N-Max: $SPEC_DRAFT_N_MAX"
-        echo "  Chimera:     $CHIMERA_MODE"
+        echo "  Chimera:     ${CHIMERA_MODE:-auto}"
         [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && echo "  Pin Layers:  $PIN_FIRST_N_LAYERS (expert tensors in VRAM)"
         if [[ "${PRUNE_EXPERTS:-0}" -gt 0 ]]; then
             prune_keep=$((8 - PRUNE_EXPERTS))
