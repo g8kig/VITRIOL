@@ -1,55 +1,120 @@
-# Session: 2026-05-15 — CE DMA Pipeline Fix
-
-## Current State
-
-CE DMA works in isolation (all 256 experts load via CE DMA at ~0.06ms each, verified). But crashes during warmup with `illegal memory access` at `ggml_cuda_mul_mat_id` line 2558 (reading `ids` tensor).
-
-## Root Causes (Two Issues)
-
-### Issue 1: `supports_buft` changes graph scheduler behavior
-Modifying `ggml_backend_cuda_device_supports_buft` to accept CPU buffer types causes the graph scheduler to route `MUL_MAT_ID` to CUDA backend. This is correct for our purposes, but the scheduler also changes how it partitions the full compute graph, leading to inconsistent tensor allocation (some tensors expected on CPU but actually on GPU, or vice versa). The `ids` tensor (MoE router output) ends up with an invalid device pointer.
-
-**Fix**: Revert `supports_buft` to original. CUDA does not accept CPU buffer types. The scheduler routes MUL_MAT_ID to CPU backend as before.
-
-### Issue 2: VRAM pool allocation during warmup
-`ensure_expert_pool()` calls `cuMemAlloc(3420 MB)` inside `vitriol_ensure_expert_loaded`, which is called from `ggml_cuda_mul_mat_id` during warmup. By this time, model tensors are already allocated in VRAM. The large `cuMemAlloc` may cause CUDA's memory manager to invalidate or move existing allocations (like the `ids` tensor).
-
-**Fix**: Move pool allocation to `vitriol_cuda_init()`, which runs during `ggml_backend_cuda_init()` — before any model tensor is allocated. At init time, ~7.9 GB is free. 3.4 GB pool → ~4.5 GB remaining, plenty for the 1.3 GB model.
-
-### Issue 3: Entry point for CE DMA
-With `supports_buft` reverted, `ggml_cuda_mul_mat_id` is not called for CPU-resident expert tensors. The CPU backend handles MUL_MAT_ID instead. Our CE DMA call was in the wrong function.
-
-**Fix**: Intercept the CPU backend's MUL_MAT_ID handler. Before it computes an expert slice via CPU matmul, CE DMA the needed slice into the VRAM pool (via bounce buffer), then launch CUDA matmul on the loaded data.
+# Session Summary — Jamba2 Experiments + Qwen3.6 Return
+**Date:** 2026-05-22 09:45-10:15
+**Status:** Qwen3.6 verified at 23.5 tok/s, Jamba2 at 2.2 tok/s
 
 ---
 
-## Files Changed
+## What Was Done
 
-### ggml-cuda.cu (reverts)
-1. Remove `supports_buft` CPU-buft addition (restore original)
-2. Remove `src0_is_cpu` detection + `vitriol_ensure_expert_loaded` call from `ggml_cuda_mul_mat_id`
+### 1. Jamba2-Mini Integration Attempt
+   - Confirmed `vitriol_cuda_init` runs via dlopen/dlsym from `libllama.so`
+   - VITRIOL pin pool works (4,116 MiB allocated, first 8 expert tensors pinned)
+   - **Output cache** (`VITRIOL_OUTPUT_CACHE=1`) corrupts output — disabled
+   - **Predictive prefetch** (`VITRIOL_PREDICTIVE_PREFETCH=1`) corrupts output (likely LRU cache returning stale data) — disabled
+   - Clean baseline: VITRIOL_MODE=stream only → **2.2 tok/s**, coherent output
+   - Root cause: Jamba2 has 16 MoE layers × 3 expert tensors = 48 tensors; pin pool covers only 17%
 
-### vitriol-cuda-integration.cpp (modifications)
-1. Move `ensure_expert_pool()` call from `vitriol_ensure_expert_loaded` to `vitriol_cuda_init()`
-2. Keep bounce-buffer CE DMA logic in `vitriol_ensure_expert_loaded` (it works)
-3. `vitriol_ensure_expert_loaded` now assumes pool is already allocated
+### 2. CAP_IPC_LOCK Enabled
+   - `sudo vitriol setup` → `cap_ipc_lock=ep` set on `llama-server` and `llama-cli`
+   - Verified with `getcap`
 
-### ggml-cpu backend (new CE DMA interceptor)
-1. Find `ggml_compute_forward_mul_mat_id` in the CPU backend
-2. At the start, if VITRIOL mode is active and src0 is an expert tensor:
-   a. Get the `ids` tensor to find which experts are active
-   b. For each active expert not in VRAM cache: CE DMA from CPU data → VRAM pool
-   c. After all active experts are in VRAM, launch CUDA kernel for matmul
-   d. Copy result back to CPU dst buffer
+### 3. Qwen3.6 Return — Verified Config
 
----
+#### Model File
+```
+/home/randozart/Desktop/Projects/Qwen3.6-35B-A3B-UD-IQ2_M.gguf
+```
 
-## Implementation Order
+#### Environment
+| Variable | Value |
+|---|---|
+| `CUDA_VISIBLE_DEVICES` | `0` |
+| `VITRIOL_MODE` | `stream` |
+| `VITRIOL_ENGINE_MODE` | `vitriol-dma` |
+| `VITRIOL_PIN_FIRST_N_LAYERS` | `8` |
+| `VITRIOL_LRU_MB` | `0` |
+| `VITRIOL_OUTPUT_CACHE` | `0` |
+| `VITRIOL_PREDICTIVE_PREFETCH` | `1` |
+| `VITRIOL_VERBOSE` | `1` |
+| `LD_LIBRARY_PATH` | `.../build/bin` |
 
-1. Write plan document ✓
-2. Revert `supports_buft` in ggml-cuda.cu
-3. Revert `src0_is_cpu` + CE DMA call in `ggml_cuda_mul_mat_id`
-4. Move pool allocation to `vitriol_cuda_init()`
-5. Find CPU backend `ggml_compute_forward_mul_mat_id`
-6. Add CE DMA interceptor in CPU backend
-7. Build and test
+#### Server Arguments
+```
+llama-server \
+  -m Qwen3.6-35B-A3B-UD-IQ2_M.gguf \
+  -ngl 99 -c 8192 --host 0.0.0.0 --port 8279 \
+  --parallel 1 -t 4 -fa on \
+  --cache-type-k q4_0 --no-mmap \
+  --checkpoint-every-n-tokens 4096 \
+  --spec-type mtp --spec-draft-n-max 2
+```
+
+#### Benchmark Results
+| Metric | Value |
+|---|---|
+| Prompt speed | 27.16 tok/s |
+| Generation speed | 23.49 tok/s |
+| Draft tokens | 32 |
+| Draft accepted | 32 (100%) |
+| Total predicted | 50 tokens in 2,129 ms |
+
+#### ~/.vitriol/config (updated)
+```
+[model]
+path = /home/randozart/Desktop/Projects/Qwen3.6-35B-A3B-UD-IQ2_M.gguf
+context = 8192
+threads = 4
+ngl = 99
+expert_count = 0
+
+[vitriol]
+mode = stream
+lru_mb = 0
+verbose = true
+output_cache = off
+predictive_prefetch = on
+pin_first_n_layers = 8
+prune_experts = 0
+reasoning = off
+
+[server]
+host = 0.0.0.0
+port = 8279
+parallel = 1
+
+[engine]
+mode = vitriol-dma
+
+[spec]
+type = mtp
+draft_n_max = 2
+```
+
+### 4. Key Code Changes From This Session
+
+- `llama-model-loader.cpp:1187-1220` — VITRIOL init via dlopen/dlsym (debugged, confirmed working)
+- `vitriol-cuda-integration.cpp:488-569` — pin pool allocation (debugged, confirmed working)
+- `scripts/vitriol:883-890` — `setup_caps()` sets `CAP_IPC_LOCK` via `sudo setcap`
+- CAP_IPC_LOCK verified: both `llama-server` and `llama-cli` have `cap_ipc_lock=ep`
+
+### 5. Jamba2 Findings for Future Reference
+
+- Jamba2 GGUF has `build_mamba_layer` (Mamba-1) graph path; weights in Mamba-1 format
+- `ssm_in` tensor (shape [4096,16384]) is loaded but **ignored** in Mamba-1 path
+- Switching to `build_mamba2_layer` would require model re-quantization (tensor shapes differ)
+- 16/32 layers have MoE (odd layers); 16 experts, 2 active per token
+- Expert tensors at IQ2_S: ~304 MiB each (3 per MoE layer)
+- VITRIOL expert pattern detection works: all 48 expert tensors detected
+- VITRIOL buffer type assigned to all expert tensors (system RAM, reported as device)
+- Pin pool allocation: 4,116 MiB @ `7964ea000000` (GTX 1070 Ti VRAM address)
+- `get_layer_index` assigns sequential IDs 0-45 to expert tensors on first forward pass
+- With `pin_first_n_layers=4`: 8 tensors pinned (model_layers 0-3), rest skipped
+
+### 6. Lessons Learned
+
+1. **Output cache corrupts output** — don't use `VITRIOL_OUTPUT_CACHE=1` (LRU key vs output cache key collision)
+2. **Predictive prefetch corrupts output** for Jamba2 — likely stale LRU data from wrong expert prediction
+3. **Clean VITRIOL_MODE=stream** (no caches) works correctly for both models
+4. **CAP_IPC_LOCK** must be re-applied after every rebuild (`sudo vitriol setup`)
+5. Jamba2 at IQ2_M (2.7 bpw) generates coherent output but at only 2.2 tok/s on GTX 1070 Ti
+6. Qwen3.6 IQ2_M with MTP achieves 23.5 tok/s on same hardware — **10× faster**

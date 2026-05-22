@@ -1,184 +1,161 @@
-# Jamba2-Mini Integration Plan: SSM-MoE for VITRIOL
+# Jamba2-Mini Integration: Findings & Plan
 
 **Date:** 2026-05-22
-**Status:** Research / Pre-Implementation
+**Status:** Updated with GGUF tensor analysis
 
 ---
 
-## The Model
+## 1. What We Know
+
+### 1.1 Model Properties (from GGUF header)
 
 | Property | Value |
 |----------|-------|
-| Base model | [AI21-Jamba2-Mini](https://huggingface.co/ai21labs/AI21-Jamba2-Mini) |
-| GGUF | [bartowski/ai21labs_AI21-Jamba2-Mini-GGUF](https://huggingface.co/bartowski/ai21labs_AI21-Jamba2-Mini-GGUF) |
-| Parameters | 52B |
-| Architecture tag | `jamba` (GGUF metadata) |
-| SSM type | Mamba-2 (grouped heads) |
-| MoE | Yes |
-| Quantization targeted | IQ2_M (16.24 GB) / IQ2_S (14.41 GB) |
-| Quantized with | llama.cpp b7652 |
-| Our build | b8848 (newer, compatible) |
+| Architecture tag | `jamba` |
+| Parameters | 52B (12B active, 16 experts, 2 experts/tok) |
+| Quantization | IQ2_M |
+| File size | 16.2 GB |
+| Layers | 32 |
+| Embedding dim (`n_embd`) | 4096 |
+| FFN dim (`n_ff`) | 14336 |
+| SSM conv kernel (`d_conv`) | 4 |
+| SSM inner size (`d_inner`) | 8192 (enforced: `2 * n_embd`) |
+| SSM state size (`d_state`) | 16 |
+| SSM dt rank (`dt_rank`) | 256 |
+| Attention heads | 32 |
+| KV heads per layer array | `[0,0,0,0,8, 0,0,0,0,0,0,0,8, ...]` |
+| Layer pattern | 4× SSM + MoE, 1× Attention + MoE, repeat |
+| Attention layers | Layers 4, 12, 20, 28 |
+| SSM layers | All other 28 layers |
+| KV cache needed | Only 4 layers × attention heads |
 
-## Architecture Analysis
-
-Jamba2-Mini is a hybrid SSM-MoE model combining:
-- **Mamba-2 SSM layers** (recurrent, no KV cache, linear-time)
-- **Attention layers** (standard multi-head, every N-th layer)
-- **MoE FFN layers** vs standard FFN (per-layer configurable)
-
-### Mamba-2 vs Mamba-1 (Critical Difference)
-
-The current `jamba.cpp` only supports **Mamba-1** (`build_mamba_layer`). Jamba2-Mini uses Mamba-2:
-
-| Feature | Mamba-1 (current jamba.cpp) | Mamba-2 (Jamba2-Mini) |
-|---------|----------------------------|----------------------|
-| Head structure | `n_head = d_inner`, `head_dim = 1` | Grouped heads (`n_head × head_dim = d_inner`) |
-| Projections | Separate per x/B/C/dt | Combined `ssm_in` tensor |
-| Group count (`ssm_n_group`) | Not used | Critical parameter |
-| Post-scan norm | No | Yes (grouped norm after scan) |
-| Activation | `silu` on x projection | `silu` on x projection |
-| Selective scan | `ggml_ssm_scan` | Same, but grouped |
-
-### Layer Arrangement (Data-Driven)
-
-Jamba loads layer types from the GGUF file via per-layer `n_head_kv_arr`:
-- `n_head_kv(il) == 0` → recurrent (SSM/Mamba) layer
-- `n_head_kv(il) > 0` → attention layer
-
-MoE vs dense FFN is determined by presence of `ffn_gate_inp` tensor per layer.
-
-Canonical Jamba pattern: every 8th layer is attention, rest are Mamba + MoE.
-
-### Key Dimensions (from `load_arch_hparams`)
-
-| Parameter | GGUF Key | Notes |
-|-----------|----------|-------|
-| `ssm_d_conv` | `ssm.conv_kernel` | Convolution kernel size (typically 4) |
-| `ssm_d_inner` | `ssm.inner_size` | Enforced: `== 2 * n_embd` |
-| `ssm_d_state` | `ssm.state_size` | SSM state dimension |
-| `ssm_dt_rank` | `ssm.time_step_rank` | Time-step projection rank |
-| `n_expert` | `expert_count` | Total experts |
-| `n_experts_per_tok` | `expert_used` | Active experts per token |
-
-### Missing for Jamba2
-
-These Mamba-2 specific hparams are **not loaded** by the current `jamba.cpp`:
-- `ssm_n_group` — group count for Mamba-2 grouped heads
-- `ssm_dt_b_c_rms` — whether dt/B/C use RMS norm
-
-## The Problem
-
-The GGUF file has architecture tag `jamba`. Our codebase will attempt to load it with `llama_model_jamba`, which expects Mamba-1 tensor names/layouts. The model will fail to load with missing tensor errors because:
-
-1. Mamba-2 uses `ssm_in` weight (combined x/B/C/dt projection) rather than separate `ssm_x`, `ssm_b`, `ssm_c`, `ssm_dt` weights
-2. Mamba-2 requires `ssm_n_group` which is not loaded by the Jamba loader
-3. Mamba-2 has grouped norm tensors that don't exist in Mamba-1
-
-## Implementation Plan
-
-### Phase 1: Add Jamba2 Architecture (~3-5 days)
-
-#### 1a. Register New Architecture
-
-**`src/llama-arch.h`:**
-```cpp
-enum llm_arch {
-    // ... existing ...
-    LLM_ARCH_JAMBA2,
-};
+Layer arrangement (from `n_head_kv` array):
+```
+blk.0  blk.1  blk.2  blk.3  | blk.4   | blk.5  blk.6  blk.7  | blk.8   | ...
+ SSM    SSM    SSM    SSM    | ATTN    | SSM    SSM    SSM    | ATTN    | ...
+ MoE    MoE    MoE    MoE    | MoE     | MoE    MoE    MoE    | MoE     | ...
 ```
 
-**`src/llama-arch.cpp`:**
-- Add `"jamba2"` to architecture name mapping
-- Add Jamba2 to hybrid architecture list (`llm_arch_is_hybrid`)
-- Add `is_recurrent` implementation (same logic: `n_head_kv(il) == 0`)
-- Set `supports_recurrent_partial_rollback = false` (same as Jamba1)
+### 1.2 Tensor Analysis: `jamba.cpp` Loader Matches GGUF File
 
-#### 1b. Create `src/models/jamba2.cpp`
+**Crucial finding:** The current `jamba.cpp` at `src/models/jamba.cpp:47-101` already loads all the tensors present in the Jamba2-Mini GGUF, including Mamba-2 specific ones:
 
-Model file implementing:
-- `load_arch_hparams` — load `ssm_n_group`, `ssm_dt_b_c_rms` in addition to standard Jamba params
-- `load_arch_tensors` — Mamba-2 tensor names (`ssm_in`, grouped `ssm_norm` tensors, per-layer `ffn_gate_inp`)
-- `graph` — layer loop:
-  - If recurrent: `build_mamba2_layer(...)` (reuse from `mamba-base.cpp`)
-  - If attention: standard attention (no RoPE, same as Jamba1)
-  - If MoE FFN: `build_moe_ffn(...)` (reuse from existing code)
-  - If dense FFN: `build_ffn(...)` (reuse)
+| Tensor | Expected Shape (jamba.cpp) | Actual Shape (GGUF) | Match? |
+|--------|---------------------------|---------------------|--------|
+| `ssm_in.weight` | `{n_embd, 2*d_inner}` = [4096, 16384] | [4096, 16384] | ✅ |
+| `ssm_conv1d.weight` | `{d_conv, d_inner}` = [4, 8192] | [4, 8192] | ✅ |
+| `ssm_conv1d.bias` | `{d_inner}` = [8192] | [8192] | ✅ |
+| `ssm_x.weight` | `{d_inner, dt_rank+2*d_state}` = [8192, 288] | [8192, 288] | ✅ |
+| `ssm_dt_norm.weight` | `{dt_rank}` = [256] | [256] | ✅ |
+| `ssm_dt.weight` | `{dt_rank, d_inner}` = [256, 8192] | [256, 8192] | ✅ |
+| `ssm_dt.bias` | `{d_inner}` = [8192] | [8192] | ✅ |
+| `ssm_b_norm.weight` | `{d_state}` = [16] | [16] | ✅ |
+| `ssm_c_norm.weight` | `{d_state}` = [16] | [16] | ✅ |
+| `ssm_a` | `{d_state, d_inner}` = [16, 8192] | [16, 8192] | ✅ |
+| `ssm_d` | `{d_inner}` = [8192] | [8192] | ✅ |
+| `ssm_out.weight` | `{d_inner, n_embd}` = [8192, 4096] | [8192, 4096] | ✅ |
 
-#### 1c. Wire Up
+**All 531 tensors match.** The model WILL load into `llama_model_jamba`.
 
-- Register in `llama_model::load_model` factory
-- Add to `llama_model_loader` architecture check
-- Register tensors in the tensor name map
+### 1.3 The Graph Problem
 
-### Phase 2: VITRIOL Predictor Adaptation (~2-3 days)
+**`jamba.cpp:128` uses `build_mamba_layer` (Mamba-1)** which:
+- Uses `ssm_x`, `ssm_dt`, `ssm_a`, `ssm_d`, `ssm_conv1d`, `ssm_out` as separate projections
+- **Ignores `ssm_in`** — the combined Mamba-2 projection tensor is loaded but never used in the graph
+- Does NOT use `ssm_b_norm`, `ssm_c_norm`, `ssm_dt_norm`
 
-The VITRIOL expert offloading predictor must become layer-type-aware:
+The Mamba-1 graph projects from `d_inner` (8192) through individual `ssm_x` [8192, 288], `ssm_dt` [256, 8192], `ssm_a` [16, 8192], etc.
 
-#### 2a. Layer Classification
+The Mamba-2 graph would project from `n_embd` (4096) through combined `ssm_in` [4096, 16384], then use grouped heads with `ssm_b_norm`, `ssm_c_norm`, `ssm_dt_norm`.
+
+**Bottom line:** The model loads. Whether it produces correct output depends on whether bartowski's conversion script produced Mamba-1-compatible weight values in `ssm_x`, `ssm_dt`, etc. Some quantizers do this (normalizing Mamba-2 weights into Mamba-1 format), others don't. The `ssm_in` weights would be completely ignored.
+
+### 1.4 What's Actually Missing for Proper Mamba-2 Support
+
+The `jamba.cpp` loader has Mamba-2 tensors but the codebase is missing:
+
+1. **`ssm_n_group` hparam** — not loaded (Mamba-2 grouped head count). Not in the GGUF either? The file doesn't have this key.
+2. **`ssm_dt_b_c_rms` flag** — not loaded. But file has individual `ssm_b_norm`, `ssm_c_norm`, `ssm_dt_norm` so norms are explicit.
+3. **Mamba-2 graph path** — `build_mamba2_layer` exists (used by Falcon-H1, Granite) but `jamba.cpp` doesn't use it.
+
+If the Mamba-1 path produces garbled output, the fix is switching `build_mamba_layer` → `build_mamba2_layer` and wiring `ssm_in` into the graph (it's already loaded as `layer.ssm_in`).
+
+---
+
+## 2. Test Results (Pending)
+
+### 2.1 Model Load Test
 
 ```
-For each layer il:
-  if recurrent (n_head_kv == 0):
-    → SSM layer → ALWAYS pin to GPU (cannot tolerate PCIe latency)
-    → No expert offloading (no MoE here)
-  if attention (n_head_kv > 0):
-    → Attention layer → ALWAYS pin to GPU
-    → No expert offloading (dense weights)
-  if ffn_gate_inp exists:
-    → MoE FFN layer → VITRIOL DMA candidate
-    → Expert-level offloading as currently implemented
-  else:
-    → Dense FFN layer → PIN to GPU
+./build/bin/llama-cli --model <path> --no-mmap -ngl 0 -c 512 -p "Hello" -n 10
 ```
 
-#### 2b. MoE Expert Detection
+Expected outcomes:
+- **Loads clean + coherent output** → jamba.cpp Mamba-1 compat path works. Skip to Phase 2.
+- **Loads clean + garbled output** → Need to switch to `build_mamba2_layer`. ~50 lines in `jamba.cpp`.
+- **Fails to load** → Tensor mismatch (unexpected given analysis above).
 
-The current VITRIOL MoE detection (looking for `ffn_gate_*` weight patterns) already handles per-layer MoE. Jamba2's per-layer `ffn_gate_inp` is compatible. The predictor just needs to skip non-MoE layers.
+### 2.2 VRAM Test
 
-#### 2c. SSM State Considerations
+```
+./build/bin/llama-server --model <path> -ngl 99 -c 4096 --no-mmap --parallel 1
+```
 
-- Mamba-2 SSM layers use `llama_memory_recurrent` (same as Qwen3.6 hybrids)
-- Partial sequentional removal (`seq_rm` tail) is NOT supported (`supports_recurrent_partial_rollback = false`)
-- **Approach E checkpoint fix is critical here** — without partial rollback, the exact-boundary checkpoint is the only way to avoid full re-prefill
-- SSM state is NOT offloadable (must stay in GPU VRAM)
+With 16.2 GB model on 8 GB VRAM, this will OOM unless VITRIOL DMA is active. Need to either:
+- Test with `-ngl 20` (partial offload)
+- Or use VITRIOL mode directly
+- Or test CPU-only with `-ngl 0`
 
-### Phase 3: VRAM Budget Planning
+---
 
-Jamba2-Mini at IQ2_S/IQ2_M is ~14-16 GB, far exceeding the GTX 1070 Ti's 8 GB VRAM. VITRIOL's DMA offloading is essential:
+## 3. Implementation Plan (Revised)
 
-| Component | Estimated VRAM | Notes |
-|-----------|---------------|-------|
-| Model weights (IQ2_S) | ~14.4 GB | DMA offloaded, ~1.5 GB resident |
-| SSM recurrent state | ~100-200 MB | Must be pinned in VRAM |
-| KV cache (attention layers) | ~500 MB* | Only attention layers, not SSM layers |
-| VITRIOL pin pool | ~1.6 GB | Pinned experts + attention weights |
-| Compute buffers | ~500 MB | Activation memory |
-| **Total VRAM needed** | **~4.3 GB** | With VITRIOL DMA |
-| **Available** | **8 GB** | GTX 1070 Ti |
+### Phase A: Verify Current Behavior
 
-*KV cache is smaller than Qwen3.6 because only attention layers (not SSM layers) need it.
+1. ✅ GGUF tensor analysis complete — shapes match
+2. 🔲 Load test — run `llama-cli` to confirm loading and output quality
+3. 🔲 If garbled: switch `build_mamba_layer` → `build_mamba2_layer` in `jamba.cpp:128`
 
-The key advantage: Jamba2-Mini is 52B but only ~1/8 of layers are attention (need KV cache), ~1/8 are dense FFN (pinned), and ~6/8 are Mamba-2 + MoE (DMA-friendly).
+### Phase B: VITRIOL Layer-Type Predictor
 
-## Blockers
+The VITRIOL predictor must become layer-type-aware to handle Jamba2:
 
-- [ ] **Model download** — in progress
-- [ ] **Test load** — need to verify GGUF architecture tag and exact tensor names
-- [ ] **Disk space** — 344 GB of `~/Desktop/OLD DATA/` needs to be freed for the 14+ GB model and build artifacts
-- [ ] **Mamba-2 scan kernel** — verify `ggml_ssm_scan` supports grouped heads (Mamba-2 mode)
+```
+per-layer classifier:
+  n_head_kv == 0  → SSM layer       → ALWAYS pin to GPU
+  n_head_kv > 0   → Attention layer  → ALWAYS pin to GPU
+  ffn_gate_inp    → MoE FFN layer   → VITRIOL DMA candidate
+  else            → Dense FFN layer  → PIN to GPU
+```
 
-## Code References
+Implementation:
+- `vitriol-cuda-integration.cpp`: add a per-layer type table queried at init time
+- `scripts/vitriol`: configure pin pool size knowing only MoE layers need DMA (not SSM layers)
+- The `llama_model_loader` already exposes per-layer `n_head_kv` so we can determine which layers are SSM vs attention vs MoE
+
+### Phase C: VRAM Budget
+
+| Component | Size | Location |
+|-----------|------|----------|
+| Model weights (IQ2_M, 16.2 GB) | ~1.6 GB resident | DMA host + GPU pin pool |
+| SSM recurrent state (28 layers) | ~200 MB | Pinned GPU |
+| KV cache (4 attention layers, 4K ctx) | ~32 MB | Pinned GPU |
+| VITRIOL pin pool | ~1.5 GB | GPU VRAM |
+| Compute buffers | ~500 MB | GPU VRAM |
+| **Total** | **~3.8 GB** | Well within 8 GB |
+
+---
+
+## 4. Key Code References
 
 | Component | File | Notes |
 |-----------|------|-------|
-| Jamba1 model | `src/models/jamba.cpp` | Template for Jamba2 |
-| Mamba-1 SSM | `src/models/mamba-base.cpp:build_mamba_layer` | Current implementation |
-| Mamba-2 SSM | `src/models/mamba-base.cpp:build_mamba2_layer` | Reusable for Jamba2 |
-| Recurrent memory | `src/llama-memory-recurrent.cpp` | SSM state management |
-| Hybrid memory | `src/llama-memory-hybrid.cpp` | Attention + SSM combined |
-| Architecture registry | `src/llama-arch.cpp` | Add JAMBA2 here |
-| Architecture header | `src/llama-arch.h` | Add enum here |
-| MoE FFN | `src/models/models.cpp:build_moe_ffn` | Reusable |
-| VITRIOL predictor | `ggml/src/ggml-cuda/vitriol-cuda-integration.cpp` | Needs layer-type awareness |
-| Expert pin pool | `scripts/vitriol` | Configuration |
+| Jamba model file | `src/models/jamba.cpp` | 198 lines total, loader + graph |
+| Mamba-1 layer | `src/models/mamba-base.cpp:build_mamba_layer` | Current graph path |
+| Mamba-2 layer | `src/models/mamba-base.cpp:build_mamba2_layer` | Used by Falcon-H1, Granite |
+| Tensor loader | `src/models/jamba.cpp:56-78` | Loads both Mamba-1 and Mamba-2 tensors |
+| Graph builder | `src/models/jamba.cpp:128` | `build_mamba_layer` — line to change |
+| Hybrid memory | `src/llama-memory-hybrid.cpp` | SSM + KV combined |
+| Recurrent memory | `src/llama-memory-recurrent.cpp` | SSM state with seq_rm limitation |
+| VITRIOL predictor | `ggml/src/ggml-cuda/vitriol-cuda-integration.cpp` | Layer-type awareness needed |
+| GGUF metadata | `ai21labs_AI21-Jamba2-Mini-IQ2_M.gguf` | 32 layers, 531 tensors |
