@@ -1331,6 +1331,10 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         SPEC_ARGS=""
         [[ -n "$SPEC_TYPE" ]] && SPEC_ARGS="--spec-type $SPEC_TYPE"
         [[ "${SPEC_DRAFT_N_MAX:-0}" -gt 0 ]] && SPEC_ARGS="$SPEC_ARGS --spec-draft-n-max $SPEC_DRAFT_N_MAX"
+        # Checkpoint interval: 4096 tokens for SSM rollback safety net (Approach A safety net)
+        # Combined with Approach E (exact-boundary checkpoint at generation end),
+        # fallback waste reduces from 4096 → ~2048 tokens worst case
+        CKPT_ARGS="--checkpoint-every-n-tokens 4096"
         # Flash Attention is required for V cache quantization and generally faster
         FA_ARGS="-fa on"
         # Reasoning/thinking mode: off for Qwen3.6 models
@@ -1377,7 +1381,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                         --parallel "$PARALLEL" \
                         --no-mmap \
                          -t "$THREADS" \
-                            $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS $REASONING_ARGS \
+                            $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS $REASONING_ARGS $CKPT_ARGS \
                             "$@" &>"${CONFIG_DIR}/llama-server.log" &
                 echo $! > "${CONFIG_DIR}/llama-server.pid"
                 echo "  llama-server PID: $! (internal port $LLAMA_PORT)"
@@ -1431,7 +1435,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                         --parallel "$PARALLEL" \
                         --no-mmap \
                         -t "$THREADS" \
-                        $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS $REASONING_ARGS \
+                        $KV_CACHE_ARGS $FA_ARGS $SPEC_ARGS $REASONING_ARGS $CKPT_ARGS \
                         "$@" &>"${CONFIG_DIR}/server.log" &
                 echo $! > "${CONFIG_DIR}/server.pid"
                 echo "  Server PID: $!"

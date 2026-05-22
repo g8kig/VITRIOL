@@ -1,7 +1,7 @@
 # Plan: Fix Within-Conversation Cache Tax
 
 **Date:** 2026-05-21
-**Status:** Draft / Planned
+**Status:** Approach E Implemented (server-context.cpp lines 3165-3172, 3284-3291)
 
 ---
 
@@ -184,11 +184,62 @@ if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
 | Extra memory per turn | — | 1 checkpoint × ~75 MiB |
 | Extra writes to cache | — | 75 MiB serialization |
 
+### Exact Implementation: Hook Points
+
+The checkpoint must be saved **after generation completes** but **before the slot releases its state**. Two insertion points:
+
+#### Hook Point 1: Non-Speculative Path
+
+**File:** `tools/server/server-context.cpp` — between lines 3163-3164:
+```cpp
+metrics.on_prediction(slot);
+// >>> INSERT HERE <<<
+slot.release();
+```
+
+#### Hook Point 2: Speculative Decode Path
+
+**File:** `tools/server/server-context.cpp` — between lines 3273-3274:
+```cpp
+metrics.on_prediction(slot);
+// >>> INSERT HERE <<<
+slot.release();
+```
+
+#### The Code to Insert
+
+```cpp
+if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+    create_checkpoint(slot, 0, pos_min, pos_max);
+}
+```
+
+Note: `n_tokens_cur = 0` because there's no pending batch at the generation end hook point — the last token has already been committed to the batch and decoded in the previous step. `create_checkpoint` uses `slot.prompt.n_tokens() - n_tokens_cur` to compute the checkpoint's start position, which correctly reflects the current total. `pos_min`/`pos_max` use `llama_memory_seq_pos_min/max` to get the actual memory sequence bounds (consistent with how the prefill code computes them, rather than assuming they equal the token count).
+
+#### Why This Works
+
+At the hook point:
+- `slot.state == SLOT_STATE_GENERATING` (still active)
+- `slot.prompt.n_tokens()` contains all committed generation tokens
+- `ctx_tgt` still has the full KV/SSM state for the slot's sequence
+- `send_final_response()` has already been called (client has result)
+- `slot.release()` hasn't been called yet (state hasn't been cleared)
+
+The new checkpoint sits at the **exact last token position**. When the next request arrives, the LCP boundary will be at this position (assuming a normal continuation), and the checkpoint restore will have **zero gap**.
+
+#### Why Creating During Generation (Rather Than At Release)
+
+Don't create a checkpoint inside the decode loop — that would serialize ~75 MiB per token, destroying performance. The hook point after `process_token()` returns false (end-of-generation signal) fires exactly once per request.
+
 ### Edge Cases
 
 1. **First request** (no prior generation): No checkpoint needed, full prefill required anyway.
-2. **Very short generations** (< 4 tokens): End-of-prompt checkpoints already cover this.
-3. **Cache eviction on save**: The 75 MiB extra per turn counts against the 8192 MiB prompt cache. At 110 turns, cache fills.
+2. **Very short generations** (< n_ubatch): Existing end-of-prompt checkpoints already cover this. The new code creates an additional checkpoint at the final position, but it will be identical to the existing end-of-prompt one (negligible overhead).
+3. **Cache eviction on save**: The ~75 MiB per checkpoint counts against the 8192 MiB prompt cache. At ~110 turns, the cache fills and oldest prompts are evicted.
+4. **Max checkpoints exceeded**: `create_checkpoint()` evicts the oldest checkpoint if `n_ctx_checkpoints` is exceeded (default 32). With Approach A (2048 interval) + E (exact boundary), expect ~17 checkpoints per full 32K prompt — well under the limit.
+5. **Non-SSM models**: Guarded by `ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL`. On models that support partial `seq_rm`, the check is false and the code is a no-op.
 
 **Recommendation:** Primary target for implementation. Combined with Approach A (2048 interval) as a safety net for edge cases.
 
@@ -196,11 +247,11 @@ if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
 
 ## Implementation Priority
 
-| Order | Approach | Time Saved | Effort | Risk | Dependencies |
-|-------|----------|-----------|--------|------|-------------|
-| 1 | **A** (2048 interval) | ~88s/turn | 1 line | None | None |
+| Order | Approach | Time Saved | Effort | Risk | Status |
+|-------|----------|-----------|--------|------|--------|
+| 1 | **A** (2048 interval) | ~88s/turn | 1 line | None | Pending config change |
 | 2 | **B** (64 max ckpts) | 0 alone | 1 line | None | Combine with A |
-| 3 | **E** (exact ckpt) | ~117s/turn | ~30 lines | Medium | Needs careful testing |
+| 3 | **E** (exact ckpt) | ~117s/turn | ~30 lines | Medium | ✅ **IMPLEMENTED** |
 | 4 | **C** (kv-unified) | 0 alone | 1 line | Medium | Revisit if MTP off + n_parallel > 1 |
 | 5 | **D** (n_rs_seq) | Negligible | ~50 lines | Low | Impractical unless VRAM freed |
 
@@ -210,11 +261,13 @@ if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
 2. Restart server
 3. Verify improvement in next continuation turn
 
-### Optimal Path (next session)
+### Optimal Path (Completed)
 
-1. Implement Approach E (exact-boundary checkpoint) in `server-context.cpp`
-2. Add Approach A/B as safety net with `--checkpoint-every-n-tokens 4096`
-3. Benchmark: measure reprocessed tokens before vs after
+1. ✅ **Approach E** implemented at both hook points in `server-context.cpp`:
+   - Non-speculative path: `server-context.cpp:3165-3172`
+   - Speculative/MTP path: `server-context.cpp:3284-3291`
+2. Add Approach A/B as safety net with `--checkpoint-every-n-tokens 4096` (pending config update)
+3. Benchmark: measure reprocessed tokens before vs after (requires disk space for logging)
 
 ---
 
@@ -233,3 +286,5 @@ if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
 | SSM rollback mechanism | `llama-memory-recurrent.cpp:172-180` | `set_rs_idx` bounded rollback |
 | `n_rs_seq` default (0) | `llama-context.cpp:3420` | Zero-initialized |
 | `--kv-unified` definition | `arg.cpp:1321-1328` / `common.h:546` | `kv_unified = false` |
+| **Approach E (non-speculative)** | `server-context.cpp:3165-3172` | Hook after `metrics.on_prediction(slot)` before `slot.release()` |
+| **Approach E (speculative/MTP)** | `server-context.cpp:3284-3291` | Same hook pattern in speculative decode path |
