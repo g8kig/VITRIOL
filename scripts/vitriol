@@ -1095,7 +1095,8 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
             echo "  → Output cache auto-disabled (pinning + output cache target different decode paths)"
         fi
         # Auto-disable pin pool at large contexts to free VRAM for KV cache + MTP head
-        if [[ "${CTX:-8192}" -gt 65536 ]] && [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]]; then
+        # Only applies when pin value comes from config (not CLI override)
+        if [[ -z "${CLI_PIN_LAYERS:-}" ]] && [[ "${CTX:-8192}" -gt 65536 ]] && [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]]; then
             echo "  → Pin layers auto-disabled (context ${CTX} > 64K — VRAM needed for KV cache)"
             PIN_FIRST_N_LAYERS=0
         fi
@@ -1304,7 +1305,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
             OUTPUT_CACHE="off"
             echo "  → Output cache auto-disabled (pinning + output cache target different decode paths)"
         fi
-        if [[ "${CTX:-8192}" -gt 65536 ]] && [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]]; then
+        if [[ -z "${CLI_PIN_LAYERS:-}" ]] && [[ "${CTX:-8192}" -gt 65536 ]] && [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]]; then
             echo "  → Pin layers auto-disabled (context ${CTX} > 64K — VRAM needed for KV cache)"
             PIN_FIRST_N_LAYERS=0
         fi
