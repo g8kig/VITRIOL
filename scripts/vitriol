@@ -36,7 +36,8 @@ DEFAULT_MEMORY_MODE="off"
 DEFAULT_KV_MODE="standard"
 DEFAULT_FROZEN_PROMPT="off"
 DEFAULT_SEMANTIC_MODE="off"
-DEFAULT_KV_QUANT="f16"
+DEFAULT_KV_QUANT="q4_0"
+DEFAULT_KV_QUANT_V="f16"
 DEFAULT_LOOKUP=0
 DEFAULT_ENGINE_MODE="vitriol-dma"
 DEFAULT_SPEC_TYPE=""
@@ -67,6 +68,7 @@ CFG_KV_MODE="$DEFAULT_KV_MODE"
 CFG_FROZEN_PROMPT="$DEFAULT_FROZEN_PROMPT"
 CFG_SEMANTIC_MODE="$DEFAULT_SEMANTIC_MODE"
 CFG_KV_QUANT="$DEFAULT_KV_QUANT"
+CFG_KV_QUANT_V="$DEFAULT_KV_QUANT_V"
 CFG_LOOKUP="$DEFAULT_LOOKUP"
 CFG_ENGINE_MODE="$DEFAULT_ENGINE_MODE"
 CFG_SPEC_TYPE="$DEFAULT_SPEC_TYPE"
@@ -121,6 +123,7 @@ parse_config() {
                 kv.mode)               CFG_KV_MODE="$val" ;;
                 kv.frozen_prompt)      CFG_FROZEN_PROMPT="$val" ;;
                 kv.quant_mode)         CFG_KV_QUANT="$val" ;;
+                kv.quant_mode_v)       CFG_KV_QUANT_V="$val" ;;
                 lookup_tokens)         CFG_LOOKUP="$val" ;;
                 engine.mode)             CFG_ENGINE_MODE="$val" ;;
                 spec.type)             CFG_SPEC_TYPE="$val" ;;
@@ -202,8 +205,10 @@ semantic_mode = $CFG_SEMANTIC_MODE
 [kv]
 # KV cache mode: standard | offload | sparse
 mode = $CFG_KV_MODE
-# KV cache quantization: f16 | q8_0 | q4_0
+# KV cache quantization: f16 | q8_0 | q4_0 (affects K cache only)
 quant_mode = $CFG_KV_QUANT
+# V cache quantization: f16 (default, safe) | q8_0 | q4_0 (RISK: quantizing V causes garbage output)
+quant_mode_v = $CFG_KV_QUANT_V
 
 # Frozen prompt: on | off (keep system prompt static to avoid re-prefix)
 frozen_prompt = $CFG_FROZEN_PROMPT
@@ -272,7 +277,8 @@ config_show() {
     print_row "  Semantic Search:     " "${CFG_SEMANTIC_MODE}"
     print_row "KV Mode:               " "${CFG_KV_MODE}"
     print_row "Frozen Prompt:         " "${CFG_FROZEN_PROMPT}"
-    print_row "KV Quant:              " "${CFG_KV_QUANT}"
+    print_row "K Quant:               " "${CFG_KV_QUANT}"
+    print_row "V Quant:               " "${CFG_KV_QUANT_V}"
     print_row "Prompt Lookup:         " "${CFG_LOOKUP}"
     print_row "Expert Count:          " "${CFG_EXPERT_COUNT:-0} (0=default)"
     print_row "Output Cache:          " "${CFG_OUTPUT_CACHE}"
@@ -734,8 +740,9 @@ tui_memory_menu() {
         printf "║  %-37s ║\n" "2) KV Mode           [${CFG_KV_MODE}]"
         printf "║  %-37s ║\n" "3) Frozen Prompt     [${CFG_FROZEN_PROMPT}]"
         printf "║  %-37s ║\n" "4) Semantic Search   [${CFG_SEMANTIC_MODE}]"
-        printf "║  %-37s ║\n" "5) KV Quant          [${CFG_KV_QUANT}]"
-        printf "║  %-37s ║\n" "6) Prompt Lookup     [${CFG_LOOKUP}]"
+        printf "║  %-37s ║\n" "5) K Cache Quant     [${CFG_KV_QUANT}]"
+        printf "║  %-37s ║\n" "6) V Cache Quant     [${CFG_KV_QUANT_V}]"
+        printf "║  %-37s ║\n" "7) Prompt Lookup     [${CFG_LOOKUP}]"
         printf "║  %-37s ║\n" "b) Back to Main Menu"
         printf "║  %-37s ║\n" "q) Quit"
         echo "╚══════════════════════════════════════════╝"
@@ -775,7 +782,8 @@ tui_memory_menu() {
                 esac
                 ;;
             5)
-                echo "Options: f16 (FP16, default) | q8_0 (8-bit) | q4_0 (4-bit, max compression)"
+                echo "K Cache quantization (affects K cache only; V cache configured separately)"
+                echo "Options: f16 (FP16) | q8_0 (8-bit) | q4_0 (4-bit, recommended, max compression)"
                 read -r -p "Enter mode: " val
                 case "$val" in
                     f16|q8_0|q4_0) config_set kv.quant_mode "$val" ;;
@@ -783,6 +791,34 @@ tui_memory_menu() {
                 esac
                 ;;
             6)
+                echo "V Cache quantization (RISK: quantizing V may produce garbage output)"
+                echo "══════════════════════════════════════════════════════════════"
+                echo "⚠  WARNING: --cache-type-v causes garbage output with VITRIOL"
+                echo "   expert offloading. Only set to q8_0 or q4_0 if you have"
+                echo "   verified it works correctly with your specific model."
+                echo "══════════════════════════════════════════════════════════════"
+                echo "Options: f16 (default, safe) | q8_0 (risky) | q4_0 (high risk)"
+                read -r -p "Enter mode: " val
+                case "$val" in
+                    f16) config_set kv.quant_mode_v "$val" ;;
+                    q8_0)
+                        echo ""
+                        echo "⚠  You selected q8_0 for V cache. This may cause garbage output."
+                        read -r -p "Type YES to confirm: " confirm
+                        [[ "$confirm" == "YES" ]] && config_set kv.quant_mode_v "$val" || echo "Cancelled"
+                        sleep 2
+                        ;;
+                    q4_0)
+                        echo ""
+                        echo "⚠  You selected q4_0 for V cache. High risk of corruption."
+                        read -r -p "Type YES to confirm: " confirm
+                        [[ "$confirm" == "YES" ]] && config_set kv.quant_mode_v "$val" || echo "Cancelled"
+                        sleep 2
+                        ;;
+                    *) echo "Invalid mode"; sleep 1 ;;
+                esac
+                ;;
+            7)
                 echo "Number of tokens to look ahead (0=disabled, 8-32 recommended)"
                 read -r -p "Enter tokens: " val
                 if [[ "$val" =~ ^[0-9]+$ ]] && ((val >= 0 && val <= 128)); then
@@ -1010,7 +1046,9 @@ case "$CMD" in
                     --kv-mode) CLI_KV_MODE="$2"; shift 2 ;;
                     --frozen-prompt) CLI_FROZEN_PROMPT="$2"; shift 2 ;;
                     --semantic-mode) CLI_SEMANTIC_MODE="$2"; shift 2 ;;
-                    --kv-quant) CLI_KV_QUANT="$2"; shift 2 ;;
+                --kv-quant) CLI_KV_QUANT="$2"; shift 2 ;;
+                --kv-quant-v) CLI_KV_QUANT_V="$2"; shift 2 ;;
+                    --kv-quant-v) CLI_KV_QUANT_V="$2"; shift 2 ;;
                     --lookup) CLI_LOOKUP="$2"; shift 2 ;;
                     --engine-mode) CLI_ENGINE_MODE="$2"; shift 2 ;;
                     --spec-type) CLI_SPEC_TYPE="$2"; shift 2 ;;
@@ -1040,6 +1078,7 @@ case "$CMD" in
         KV_QUANT="${CLI_KV_QUANT:-${CFG_KV_QUANT}}"
         LOOKUP="${CLI_LOOKUP:-${CFG_LOOKUP}}"
         ENGINE_MODE="${CLI_ENGINE_MODE:-${CLI_ENGINE_MODE:-${CFG_ENGINE_MODE}}}"
+        KV_QUANT_V="${CLI_KV_QUANT_V:-${CFG_KV_QUANT_V}}"
 DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         SPEC_TYPE="${CLI_SPEC_TYPE:-${CFG_SPEC_TYPE}}"
         SPEC_DRAFT_N_MAX="${CLI_SPEC_DRAFT_N_MAX:-${CFG_SPEC_DRAFT_N_MAX}}"
@@ -1106,7 +1145,8 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         echo "  KV Mode:     $KV_MODE"
         echo "  Frozen:      $FROZEN_PROMPT"
         echo "  Semantic:    $SEMANTIC_MODE"
-        echo "  KV Quant:    $KV_QUANT"
+        echo "  K Quant:     $KV_QUANT"
+        echo "  V Quant:     ${KV_QUANT_V:-f16}"
         echo "  Lookup:      $LOOKUP"
         echo "  Engine:      $ENGINE_MODE"
         [[ -n "$SPEC_TYPE" ]] && echo "  Spec Type:   $SPEC_TYPE"
@@ -1244,6 +1284,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         KV_QUANT="${CLI_KV_QUANT:-${CFG_KV_QUANT}}"
         LOOKUP="${CLI_LOOKUP:-${CFG_LOOKUP}}"
         ENGINE_MODE="${CLI_ENGINE_MODE:-${CLI_ENGINE_MODE:-${CFG_ENGINE_MODE}}}"
+        KV_QUANT_V="${CLI_KV_QUANT_V:-${CFG_KV_QUANT_V}}"
         DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         SPEC_TYPE="${CLI_SPEC_TYPE:-${CFG_SPEC_TYPE}}"
         SPEC_DRAFT_N_MAX="${CLI_SPEC_DRAFT_N_MAX:-${CFG_SPEC_DRAFT_N_MAX}}"
@@ -1304,7 +1345,8 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         echo "  KV Mode:     $KV_MODE"
         echo "  Frozen:      $FROZEN_PROMPT"
         echo "  Semantic:    $SEMANTIC_MODE"
-        echo "  KV Quant:    $KV_QUANT"
+        echo "  K Quant:     $KV_QUANT"
+        echo "  V Quant:     ${KV_QUANT_V:-f16}"
         echo "  Lookup:      $LOOKUP"
         echo "  Engine:      $ENGINE_MODE"
         [[ -n "$SPEC_TYPE" ]] && echo "  Spec Type:   $SPEC_TYPE"
@@ -1337,11 +1379,12 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         ENV_PREDICTIVE_PREFETCH=""
         [[ "$PREDICTIVE_PREFETCH" == "on" ]] && ENV_PREDICTIVE_PREFETCH="VITRIOL_PREDICTIVE_PREFETCH=1"
 
-        # KV cache quant args (pass to llama-server as --cache-type-k)
-        # NOTE: --cache-type-v causes garbage output with VITRIOL (expert offloading corrupts quantized V cache)
-        # Only quantize K cache; leave V at f16 precision.
+        # KV cache quant args (pass to llama-server as --cache-type-k and --cache-type-v)
+        # NOTE: Setting --cache-type-v to q8_0 or q4_0 may produce garbage output with
+        # VITRIOL expert offloading — leave V at f16 unless you've verified it works.
         KV_CACHE_ARGS=""
         [[ "$KV_QUANT" != "f16" ]] && KV_CACHE_ARGS="--cache-type-k $KV_QUANT"
+        [[ "${KV_QUANT_V:-f16}" != "f16" ]] && KV_CACHE_ARGS="$KV_CACHE_ARGS --cache-type-v $KV_QUANT_V"
         # Speculative decoding args
         SPEC_ARGS=""
         [[ -n "$SPEC_TYPE" ]] && SPEC_ARGS="--spec-type $SPEC_TYPE"
