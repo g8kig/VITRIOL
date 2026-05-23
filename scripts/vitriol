@@ -18,6 +18,7 @@ SERVER_BINARY="${LLAMA_DIR}/build/bin/llama-server"
 HEADER_FILE="${PROJECT_DIR}/assets/vitriol-header.txt"
 CONFIG_DIR="${HOME}/.vitriol"
 CONFIG_FILE="${CONFIG_DIR}/config"
+PROFILES_DIR="${CONFIG_DIR}/profiles"
 
 # ── defaults ─────────────────────────────────────────────────────
 DEFAULT_MODEL="/home/randozart/Desktop/Projects/Qwen3.6-35B-A3B-UD-IQ2_M.gguf"
@@ -361,6 +362,220 @@ config_set() {
 }
 
 # ═════════════════════════════════════════════════════════════════
+# CONFIG PROFILES (save/load/list/delete/diff)
+# ═════════════════════════════════════════════════════════════════
+
+profiles_save() {
+    local name="$1" desc="${2:-}"
+    if [[ -z "$name" ]]; then
+        echo "Usage: vitriol config save <name> [description]"
+        return 1
+    fi
+    # Validate name (alphanumeric, hyphens, underscores only)
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo "Error: profile name must contain only letters, numbers, hyphens, and underscores"
+        return 1
+    fi
+    local profile_dir="${PROFILES_DIR}/${name}"
+    mkdir -p "$profile_dir"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cp "$CONFIG_FILE" "${profile_dir}/config"
+    else
+        # If no config file exists yet, write one from current CFG_ values
+        write_config
+        cp "$CONFIG_FILE" "${profile_dir}/config"
+    fi
+    # Write metadata
+    cat > "${profile_dir}/meta" <<METAEOF
+name=${name}
+description=${desc:-$(date +"%Y-%m-%d %H:%M")}
+created=$(date +%s)
+METAEOF
+    echo "✓ Profile '${name}' saved"
+    [[ -n "$desc" ]] && echo "  Description: ${desc}"
+}
+
+profiles_load() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        echo "Usage: vitriol config load <name>"
+        return 1
+    fi
+    local profile_dir="${PROFILES_DIR}/${name}"
+    if [[ ! -f "${profile_dir}/config" ]]; then
+        echo "Error: profile '${name}' not found"
+        echo "  Available profiles:"
+        profiles_list
+        return 1
+    fi
+    # Show diff before loading
+    profiles_diff "$name"
+    echo ""
+    # Back up current config
+    local bak="${CONFIG_FILE}.bak"
+    [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "$bak"
+    # Copy profile to main config
+    cp "${profile_dir}/config" "$CONFIG_FILE"
+    # Reload config into CFG_ vars
+    parse_config
+    echo ""
+    echo "✓ Profile '${name}' loaded"
+    echo "  Restart the server to apply: vitriol stop && vitriol serve"
+}
+
+profiles_list() {
+    if [[ ! -d "$PROFILES_DIR" ]]; then
+        echo "No profiles saved yet."
+        return 0
+    fi
+    local count=0
+    for dir in "$PROFILES_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        local name="$(basename "$dir")"
+        local desc="" created=""
+        if [[ -f "${dir}meta" ]]; then
+            desc=$(grep "^description=" "${dir}meta" | cut -d= -f2-)
+            created=$(grep "^created=" "${dir}meta" | cut -d= -f2)
+            if [[ -n "$created" ]]; then
+                created=$(date -d "@${created}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$created")
+            fi
+        fi
+        if [[ -z "$desc" ]]; then
+            desc="(no description)"
+        fi
+        printf "  %-20s %-40s %s\n" "$name" "$desc" "${created:+- $created}"
+        count=$((count + 1))
+    done
+    if [[ "$count" -eq 0 ]]; then
+        echo "No profiles saved yet."
+    fi
+}
+
+profiles_delete() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        echo "Usage: vitriol config delete <name>"
+        return 1
+    fi
+    local profile_dir="${PROFILES_DIR}/${name}"
+    if [[ ! -d "$profile_dir" ]]; then
+        echo "Error: profile '${name}' not found"
+        return 1
+    fi
+    echo "Delete profile '${name}'? This cannot be undone."
+    read -r -p "Type YES to confirm: " confirm
+    if [[ "$confirm" != "YES" ]]; then
+        echo "Cancelled"
+        return 0
+    fi
+    rm -rf "$profile_dir"
+    echo "✓ Profile '${name}' deleted"
+}
+
+profiles_diff() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        echo "Usage: vitriol config diff <name>"
+        return 1
+    fi
+    local profile_dir="${PROFILES_DIR}/${name}"
+    if [[ ! -f "${profile_dir}/config" ]]; then
+        echo "Error: profile '${name}' not found"
+        return 1
+    fi
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Current config is empty. Profile contains:"
+        sed -n '/^[a-zA-Z]/p' "${profile_dir}/config"
+        return 0
+    fi
+
+    # Extract key=value pairs from both files (skip comments, sections, blank lines)
+    local curr_keys=$(mktemp)
+    local prof_keys=$(mktemp)
+    grep -v '^\s*#' "$CONFIG_FILE" | grep -v '^\s*$' | grep -v '^\[' | sed 's/^[[:space:]]*//' > "$curr_keys"
+    grep -v '^\s*#' "${profile_dir}/config" | grep -v '^\s*$' | grep -v '^\[' | sed 's/^[[:space:]]*//' > "$prof_keys"
+
+    local has_diff=0
+    while IFS= read -r line; do
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        # Find matching key in current
+        local curr_val=$(grep "^${key}=" "$curr_keys" | head -1 | cut -d= -f2-)
+        if [[ "$curr_val" != "$val" ]]; then
+            if [[ "$has_diff" -eq 0 ]]; then
+                echo "Diff between current config and profile '${name}':"
+                echo ""
+                has_diff=1
+            fi
+            printf "  %-30s current=%-12s profile=%-12s\n" "${key}" "${curr_val:-}" "${val:-}"
+        fi
+    done < "$prof_keys"
+
+    # Also check keys in current but not in profile
+    while IFS= read -r line; do
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        local prof_val=$(grep "^${key}=" "$prof_keys" | head -1 | cut -d= -f2-)
+        if [[ -z "$prof_val" ]]; then
+            if [[ "$has_diff" -eq 0 ]]; then
+                echo "Diff between current config and profile '${name}':"
+                echo ""
+                has_diff=1
+            fi
+            printf "  %-30s current=%-12s profile=(not set)\n" "${key}" "${val}"
+        fi
+    done < "$curr_keys"
+
+    rm -f "$curr_keys" "$prof_keys"
+
+    if [[ "$has_diff" -eq 0 ]]; then
+        echo "Current config matches profile '${name}' exactly."
+    fi
+}
+
+# Interactive profile selector for TUI
+tui_profile_select() {
+    local action="$1"  # "load" or "delete"
+    local profiles=()
+    if [[ ! -d "$PROFILES_DIR" ]]; then
+        echo "No profiles saved yet. Use 'Save Config Profile' first."
+        return 1
+    fi
+    for dir in "$PROFILES_DIR"/*/; do
+        [[ -d "$dir" ]] && profiles+=("$(basename "$dir")")
+    done
+    if [[ ${#profiles[@]} -eq 0 ]]; then
+        echo "No profiles saved yet."
+        return 1
+    fi
+    echo ""
+    echo "Available profiles:"
+    local i=1
+    for p in "${profiles[@]}"; do
+        local desc=""
+        if [[ -f "${PROFILES_DIR}/${p}/meta" ]]; then
+            desc=$(grep "^description=" "${PROFILES_DIR}/${p}/meta" | cut -d= -f2-)
+        fi
+        printf "  %d) %-15s %s\n" "$i" "$p" "${desc:-}"
+        i=$((i+1))
+    done
+    echo ""
+    read -r -p "Select profile [1-${#profiles[@]}]: " sel
+    if [[ "$sel" =~ ^[0-9]+$ ]] && ((sel >= 1 && sel <= ${#profiles[@]})); then
+        local chosen="${profiles[$((sel-1))]}"
+        if [[ "$action" == "load" ]]; then
+            profiles_load "$chosen"
+        else
+            profiles_delete "$chosen"
+        fi
+        return 0
+    else
+        echo "Invalid selection"
+        return 1
+    fi
+}
+
+# ═════════════════════════════════════════════════════════════════
 # MTP DETECTION
 # ═════════════════════════════════════════════════════════════════
 
@@ -408,10 +623,13 @@ tui_main_menu() {
         printf "║  %-37s ║\n" "6) Server Settings"
         printf "║  %-37s ║\n" "7) Show Current Config"
         printf "║  %-37s ║\n" "8) Reset to Defaults"
+        printf "║  %-37s ║\n" "9) Save Config Profile"
+        printf "║  %-37s ║\n" "10) Load Config Profile"
+        printf "║  %-37s ║\n" "11) Manage Profiles"
         printf "║  %-37s ║\n" "q) Quit"
         echo "╚══════════════════════════════════════════╝"
         echo ""
-        read -r -p "Select [1-9/q]: " choice
+        read -r -p "Select [1-11/q]: " choice
         case "$choice" in
             1) tui_gpu_menu ;;
             2) tui_model_menu ;;
@@ -421,6 +639,47 @@ tui_main_menu() {
             6) tui_server_menu ;;
             7) clear; print_header; config_show; echo ""; read -r -p "Press Enter to continue..." ;;
             8) config_reset; echo ""; read -r -p "Press Enter to continue..." ;;
+            9)
+                echo ""
+                echo "Save current configuration as a named profile."
+                echo "Profiles can be loaded later via 'Load Config Profile'."
+                echo ""
+                read -r -p "Profile name: " name
+                if [[ -z "$name" ]]; then
+                    echo "Cancelled"; sleep 1
+                else
+                    read -r -p "Description (optional): " desc
+                    profiles_save "$name" "$desc"
+                    echo ""; read -r -p "Press Enter to continue..."
+                fi
+                ;;
+            10)
+                clear; print_header
+                echo "Load a config profile — this overwrites your current config."
+                tui_profile_select "load"
+                echo ""; read -r -p "Press Enter to continue..."
+                ;;
+            11)
+                clear; print_header
+                profiles_list
+                echo ""
+                echo "Options:"
+                echo "  1) Delete a profile"
+                echo "  2) View diff between current and a profile"
+                echo "  b) Back"
+                echo ""
+                read -r -p "Select [1-2/b]: " action
+                case "$action" in
+                    1) tui_profile_select "delete" ;;
+                    2)
+                        echo ""
+                        read -r -p "Profile name: " pname
+                        [[ -n "$pname" ]] && profiles_diff "$pname"
+                        ;;
+                    *) ;;
+                esac
+                echo ""; read -r -p "Press Enter to continue..."
+                ;;
             q|Q) clear; exit 0 ;;
             *) ;;
         esac
@@ -1802,6 +2061,11 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
             reset) config_reset ;;
             edit)  ${EDITOR:-vim} "$CONFIG_FILE" ;;
             set)   shift; config_set "$1" "$2" ;;
+            save)  shift; profiles_save "$1" "$2" ;;
+            load)  shift; profiles_load "$1" ;;
+            list)  profiles_list ;;
+            delete) shift; profiles_delete "$1" ;;
+            diff)  shift; profiles_diff "$1" ;;
             *)     tui_main_menu ;;
         esac
         ;;
