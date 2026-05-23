@@ -50,6 +50,7 @@ DEFAULT_PREDICTIVE_PREFETCH="off"
 DEFAULT_PIN_FIRST_N_LAYERS=0
 DEFAULT_PRUNE_EXPERTS=0
 DEFAULT_REASONING="off"
+DEFAULT_UBATCH=256
 
 # ── config vars (set by parse_config) ────────────────────────────
 CFG_DEVICE="$DEFAULT_DEVICE"
@@ -81,6 +82,7 @@ CFG_PIN_FIRST_N_LAYERS="$DEFAULT_PIN_FIRST_N_LAYERS"
 CFG_PRUNE_EXPERTS="$DEFAULT_PRUNE_EXPERTS"
 CFG_REASONING="$DEFAULT_REASONING"
 CFG_CHIMERA_MODE="$DEFAULT_CHIMERA_MODE"
+CFG_UBATCH="$DEFAULT_UBATCH"
 
 # ═════════════════════════════════════════════════════════════════
 # CONFIG PARSING
@@ -125,6 +127,7 @@ parse_config() {
                 kv.frozen_prompt)      CFG_FROZEN_PROMPT="$val" ;;
                 kv.quant_mode)         CFG_KV_QUANT="$val" ;;
                 kv.quant_mode_v)       CFG_KV_QUANT_V="$val" ;;
+                kv.ubatch_size)        CFG_UBATCH="$val" ;;
                 lookup_tokens)         CFG_LOOKUP="$val" ;;
                 engine.mode)             CFG_ENGINE_MODE="$val" ;;
                 spec.type)             CFG_SPEC_TYPE="$val" ;;
@@ -213,6 +216,8 @@ quant_mode_v = $CFG_KV_QUANT_V
 
 # Frozen prompt: on | off (keep system prompt static to avoid re-prefix)
 frozen_prompt = $CFG_FROZEN_PROMPT
+# Physical batch size (default 256, lower = less VRAM for compute buffers)
+ubatch_size = $CFG_UBATCH
 
 [engine]
 # Execution mode: vitriol-dma | native
@@ -302,6 +307,7 @@ config_show() {
     print_row "Server Host:           " "${CFG_HOST}"
     print_row "Server Port:           " "${CFG_PORT}"
     print_row "Parallel Slots:        " "${CFG_PARALLEL}"
+    print_row "UBatch Size:           " "${CFG_UBATCH}"
     echo "╚$(printf '═%.0s' $(seq 1 $box_w))╝"
 }
 
@@ -321,6 +327,7 @@ config_reset() {
     CFG_PORT="$DEFAULT_PORT"
     CFG_HOST="$DEFAULT_HOST"
     CFG_PARALLEL="$DEFAULT_PARALLEL"
+    CFG_UBATCH="$DEFAULT_UBATCH"
     write_config
     echo "✓ Config reset to defaults"
 }
@@ -350,6 +357,8 @@ config_set() {
         memory.semantic_mode)  CFG_SEMANTIC_MODE="$val" ;;
         kv.mode)               CFG_KV_MODE="$val" ;;
         kv.quant_mode)         CFG_KV_QUANT="$val" ;;
+        kv.quant_mode_v)       CFG_KV_QUANT_V="$val" ;;
+        kv.ubatch_size)        CFG_UBATCH="$val" ;;
         lookup_tokens)          CFG_LOOKUP="$val" ;;
         engine.mode)           CFG_ENGINE_MODE="$val" ;;
         spec.type)             CFG_SPEC_TYPE="$val" ;;
@@ -1291,6 +1300,7 @@ case "$CMD" in
             CLI_SPEC_DRAFT_N_MAX=""
             CLI_PIN_LAYERS=""
             CLI_PRUNE_EXPERTS=""
+            CLI_UBATCH=""
             DRY_RUN=false
 
             while [[ $# -gt 0 ]]; do
@@ -1316,6 +1326,7 @@ case "$CMD" in
                     --disk-offload) CLI_DISK_OFFLOAD="1"; shift ;;
                     --pin-layers) CLI_PIN_LAYERS="$2"; shift 2 ;;
                     --prune-experts) CLI_PRUNE_EXPERTS="$2"; shift 2 ;;
+                    --ubatch-size) CLI_UBATCH="$2"; shift 2 ;;
                     --dry-run) DRY_RUN=true; shift;;
                     -h|--help) usage; exit 0 ;;
                     *) echo "Unknown: $1"; usage; exit 1 ;;
@@ -1348,6 +1359,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         PIN_FIRST_N_LAYERS="${CLI_PIN_LAYERS:-${CFG_PIN_FIRST_N_LAYERS}}"
         PRUNE_EXPERTS="${CLI_PRUNE_EXPERTS:-${CFG_PRUNE_EXPERTS}}"
         CHIMERA_MODE="${CLI_CHIMERA_MODE:-${CFG_CHIMERA_MODE}}"
+        UBATCH="${CLI_UBATCH:-${CFG_UBATCH}}"
         # Auto-disable output cache when pinning is active
         if [[ "${PIN_FIRST_N_LAYERS:-0}" -gt 0 ]] && [[ "$OUTPUT_CACHE" == "on" ]]; then
             OUTPUT_CACHE="off"
@@ -1496,6 +1508,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         CLI_DISK_OFFLOAD=""
         CLI_SPEC_TYPE=""
         CLI_SPEC_DRAFT_N_MAX=""
+        CLI_UBATCH=""
         CLI_PIN_LAYERS=""
         CLI_PRUNE_EXPERTS=""
         CLI_REASONING=""
@@ -1521,6 +1534,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
                 --engine-mode) CLI_ENGINE_MODE="$2"; shift 2 ;;
                 --spec-type) CLI_SPEC_TYPE="$2"; shift 2 ;;
                 --spec-draft-n-max) CLI_SPEC_DRAFT_N_MAX="$2"; shift 2 ;;
+                --ubatch-size) CLI_UBATCH="$2"; shift 2 ;;
                 --disk-offload) CLI_DISK_OFFLOAD="1"; shift ;;
                 --pin-layers) CLI_PIN_LAYERS="$2"; shift 2 ;;
                 --prune-experts) CLI_PRUNE_EXPERTS="$2"; shift 2 ;;
@@ -1555,6 +1569,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         SPEC_DRAFT_N_MAX="${CLI_SPEC_DRAFT_N_MAX:-${CFG_SPEC_DRAFT_N_MAX}}"
         EXPERT_COUNT="${CFG_EXPERT_COUNT}"
         OUTPUT_CACHE="${CFG_OUTPUT_CACHE}"
+        UBATCH="${CLI_UBATCH:-${CFG_UBATCH}}"
         REASONING="${CFG_REASONING}"
         PREDICTIVE_PREFETCH="${CFG_PREDICTIVE_PREFETCH}"
         PIN_FIRST_N_LAYERS="${CLI_PIN_LAYERS:-${CFG_PIN_FIRST_N_LAYERS}}"
@@ -1668,7 +1683,7 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         #   --kv-unified: shared KV buffer across sequences (required for cache-idle-slots)
         #   --cache-idle-slots: persist full state (incl. RS/SSM buffers) on slot release
         #   --ubatch-size 256: reduce compute buffer pressure, may reduce graph splits
-        CACHE_ARGS="--kv-unified --cache-idle-slots --ubatch-size 256"
+        CACHE_ARGS="--kv-unified --cache-idle-slots --ubatch-size ${UBATCH:-256}"
         # Reasoning/thinking mode: off for Qwen3.6 models
         REASONING_ARGS=""
         [[ "${REASONING}" == "off" ]] && REASONING_ARGS="--reasoning off"
