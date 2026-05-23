@@ -66,6 +66,8 @@ All flags can be set via CLI flag, env var, or the TUI (`vitriol config`).
 
 **OpenCode setup:** [`docs/OPENCODE_SETUP.md`](docs/OPENCODE_SETUP.md) — configuring VITRIOL as an OpenCode provider, why `vitriol setup` is required, workflow recommendations.
 
+**Integration** — VITRIOL exposes an OpenAI-compatible API at `http://0.0.0.0:8279/v1`, compatible with OpenCode, little-coder, and any OpenAI SDK client. Config profiles (`vitriol config save|load`) let you switch between presets like `balanced` (136K ctx, MTP2) and `little-coder` (65K ctx, pin10, MTP3) without rebuilding. See [`docs/OPENCODE_SETUP.md`](docs/OPENCODE_SETUP.md) for detailed setup.
+
 **Test results:** [`docs/TEST_REPORT_2026-05-17.md`](docs/TEST_REPORT_2026-05-17.md) — measured tok/s, VRAM savings, and bug fixes.
 
 
