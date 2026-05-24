@@ -22,3 +22,15 @@
 - The VITRIOL predictor is in `ggml/src/ggml-cuda/vitriol-cuda-integration.cpp`.
 - The server context checkpoint logic is in `tools/server/server-context.cpp`.
 - All VITRIOL env vars are prefixed with `VITRIOL_`.
+
+## Calibration Tool (Rust)
+
+- **`libvitriol/`** — Rust binary for `vitriol calibrate --quick`.
+- Build with `cargo build --release` in `libvitriol/`.
+- Source files: `gguf.rs` (GGUF v3 parser), `probe.rs` (hardware), `estimator.rs` (VRAM model), `main.rs` (CLI).
+- The Rust binary is called by `scripts/vitriol` if built; falls back to Python `libvitriol/gguf_reader.py`.
+- **No hardcoded model constants** — all VRAM values computed from GGUF tensor data.
+- Self-computing formula: `VRAM = base_model + pin * per_layer_expert + ctx * kv_per_token + scratch + overhead`.
+- Overhead heuristic: Pascal=1800, Turing=2200, Ampere=2800, Ada=3200 MiB.
+- KV cache computed from model dims: `(embd_len / head_count) * head_count_kv * 2.5 / 1M`.
+- Per-layer expert cost from tensor name analysis (`ffn_*_exps` patterns).
