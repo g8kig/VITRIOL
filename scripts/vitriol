@@ -1276,6 +1276,17 @@ HEREDOC
 # ═════════════════════════════════════════════════════════════════
 
 CALIBRATION_SCRIPT="${SCRIPT_DIR}/../libvitriol/gguf_reader.py"
+CALIBRATE_BINARY="${PROJECT_DIR}/libvitriol/target/release/vitriol-calibrate"
+
+# Try Rust binary first, fall back to Python
+calibrate_use_rust() {
+    if [[ -x "$CALIBRATE_BINARY" ]]; then
+        return 0
+    fi
+    # Try debug build
+    CALIBRATE_BINARY="${PROJECT_DIR}/libvitriol/target/debug/vitriol-calibrate"
+    [[ -x "$CALIBRATE_BINARY" ]]
+}
 
 calibrate_probe_hardware() {
     local out="$CALIBRATION_DIR/hardware.json"
@@ -1450,8 +1461,19 @@ calibrate_quick() {
         return 1
     fi
 
+    # Try Rust binary first
+    if calibrate_use_rust; then
+        "$CALIBRATE_BINARY" calibrate --quick --model "$model_path"
+        local rc=$?
+        if [[ $rc -eq 0 ]]; then
+            return 0
+        fi
+        echo "Rust calibration failed (exit $rc), falling back to Python..."
+    fi
+
+    # Fallback: Python-based calibration
     if ! command -v python3 &>/dev/null; then
-        echo "ERROR: python3 required for calibration"
+        echo "ERROR: python3 required for calibration (Rust binary not available)"
         return 1
     fi
 
