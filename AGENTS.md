@@ -34,3 +34,19 @@
 - Overhead heuristic: Pascal=1800, Turing=2200, Ampere=2800, Ada=3200 MiB.
 - KV cache computed from model dims: `(embd_len / head_count) * head_count_kv * 2.5 / 1M`.
 - Per-layer expert cost from tensor name analysis (`ffn_*_exps` patterns).
+
+## Sweep Controller (Python)
+
+- **`libvitriol/sweep_controller.py`** — automated benchmark sweep via HTTP POST `/completion`
+- Starts `llama-server` subprocess per config, benchmarks 64-token generation (1 warmup + 3 measured rounds), reports t/s
+- Server readiness: polls `/health` then `/completion` until model fully loads (~15s warmup on GTX 1070 Ti)
+- Use: `python3 libvitriol/sweep_controller.py --model <path> --pin 0 8 12 16 --mtp 0 3 5 6`
+- Sweep results: 25-config full sweep runs in ~20 minutes; MTP provides zero benefit on this hardware (all scores ~9.7-9.98 t/s)
+
+## MTP (No Benefit on This Hardware)
+
+- Full 5×5 sweep (pin 0/4/8/12/16 × mtp 0/2/4/5/6) completed
+- **All configs: 9.6–9.98 t/s**, tightly clustered — MTP has zero measurable effect with Qwen3.6-35B on GTX 1070 Ti
+- pin=16 + MTP regresses to 8.58 t/s (VRAM pressure from draft buffers)
+- **Optimal: pin=12, mtp=0 or mtp=2, ubatch=128, ctx=65536** → 9.98 t/s
+- Full report: `.opencode/plans/mtp-sweep-report-2026-05-25.md`
