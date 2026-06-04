@@ -1,0 +1,3 @@
+name=mellum2
+description=Mellum2-12B-A2.5B-Instruct-Q4_K_M optimal (ngl=24 ctx=32k → 27 t/s)
+created=1749045180

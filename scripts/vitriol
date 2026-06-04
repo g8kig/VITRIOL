@@ -19,6 +19,7 @@ HEADER_FILE="${PROJECT_DIR}/assets/vitriol-header.txt"
 CONFIG_DIR="${HOME}/.vitriol"
 CONFIG_FILE="${CONFIG_DIR}/config"
 PROFILES_DIR="${CONFIG_DIR}/profiles"
+BUNDLED_PROFILES_DIR="${PROJECT_DIR}/profiles"
 CALIBRATION_DIR="${CONFIG_DIR}/calibration"
 
 # ── defaults ─────────────────────────────────────────────────────
@@ -412,6 +413,15 @@ profiles_load() {
         return 1
     fi
     local profile_dir="${PROFILES_DIR}/${name}"
+
+    # Auto-install from bundled profiles if not already installed
+    local bundled_dir="${BUNDLED_PROFILES_DIR}/${name}"
+    if [[ ! -f "${profile_dir}/config" ]] && [[ -f "${bundled_dir}/config" ]]; then
+        mkdir -p "${PROFILES_DIR}/${name}"
+        cp "${bundled_dir}/config" "${profile_dir}/config"
+        cp "${bundled_dir}/meta"  "${profile_dir}/meta" 2>/dev/null
+    fi
+
     if [[ ! -f "${profile_dir}/config" ]]; then
         echo "Error: profile '${name}' not found"
         echo "  Available profiles:"
@@ -434,31 +444,51 @@ profiles_load() {
 }
 
 profiles_list() {
-    if [[ ! -d "$PROFILES_DIR" ]]; then
-        echo "No profiles saved yet."
-        return 0
-    fi
     local count=0
-    for dir in "$PROFILES_DIR"/*/; do
-        [[ -d "$dir" ]] || continue
-        local name="$(basename "$dir")"
-        local desc="" created=""
-        if [[ -f "${dir}meta" ]]; then
-            desc=$(grep "^description=" "${dir}meta" | cut -d= -f2-)
-            created=$(grep "^created=" "${dir}meta" | cut -d= -f2)
-            if [[ -n "$created" ]]; then
-                created=$(date -d "@${created}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$created")
-            fi
-        fi
-        if [[ -z "$desc" ]]; then
-            desc="(no description)"
-        fi
-        printf "  %-20s %-40s %s\n" "$name" "$desc" "${created:+- $created}"
-        count=$((count + 1))
-    done
-    if [[ "$count" -eq 0 ]]; then
-        echo "No profiles saved yet."
+
+    # Show user profiles
+    if [[ -d "$PROFILES_DIR" ]]; then
+        for dir in "$PROFILES_DIR"/*/; do
+            [[ -d "$dir" ]] || continue
+            _print_profile_entry "$dir"
+            count=$((count + 1))
+        done
     fi
+
+    # Show bundled profiles not yet installed
+    if [[ -d "$BUNDLED_PROFILES_DIR" ]]; then
+        for dir in "$BUNDLED_PROFILES_DIR"/*/; do
+            [[ -d "$dir" ]] || continue
+            local name="$(basename "$dir")"
+            [[ -d "${PROFILES_DIR}/${name}" ]] && continue  # already shown above
+            _print_profile_entry "$dir"
+            count=$((count + 1))
+        done
+    fi
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "No profiles available."
+        echo "Create one with: vitriol config save <name>"
+    fi
+}
+
+_print_profile_entry() {
+    local dir="$1"
+    local name="$(basename "$dir")"
+    local desc="" created="" source=""
+    if [[ -f "${dir}meta" ]]; then
+        desc=$(grep "^description=" "${dir}meta" | cut -d= -f2-)
+        created=$(grep "^created=" "${dir}meta" | cut -d= -f2)
+        if [[ -n "$created" ]]; then
+            created=$(date -d "@${created}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$created")
+        fi
+    fi
+    # Tag bundled profiles
+    if [[ "$dir" == "${BUNDLED_PROFILES_DIR}"/* ]]; then
+        name="${name} [bundled]"
+    fi
+    [[ -z "$desc" ]] && desc="(no description)"
+    printf "  %-25s %-40s %s\n" "$name" "$desc" "${created:+- $created}"
 }
 
 profiles_delete() {

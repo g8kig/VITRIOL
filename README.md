@@ -79,7 +79,21 @@ The problem: the best open-weight models are MoE architectures (Mixture of Exper
 
 VITRIOL's insight: MoE models only activate ~2-8 out of 256 experts per token. The expert weights don't need to live in VRAM. Keep them in **page-locked system RAM** instead — the GPU reads them over PCIe DMA on demand. The base model, attention weights, KV cache, and compute buffers stay in VRAM. Only the experts are offloaded.
 
-**Result:** 23.3 tok/s on a GTX 1070 Ti (8 GB) with a Qwen3.6-35B MoE model via the Chimera dual-backend (CUDA+Vulkan) — **+309% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL.
+**Result:** 23.3 tok/s on a GTX 1070 Ti (8 GB) with a Qwen3.6-35B MoE model via the Chimera dual-backend (CUDA+Vulkan) — **+309% vs the pre-VITRIOL x8 baseline** (5.7 tok/s). The model doesn't fit at all without VITRIOL. **27.1 tok/s** on the same hardware with Mellum2-12B-A2.5B (Q4_K_M).
+
+### Recommended Models
+
+| Model | Quant | VRAM (model) | t/s | Notes |
+|-------|-------|-------------|-----|-------|
+| [Mellum2-12B-A2.5B-Instruct](https://huggingface.co/CodeFault/Mellum2-12B-A2.5B-Instruct-GGUF) | Q4_K_M (7.5 GB) | 6228 MiB | **27.1** | 64 MoE experts / 8 active, native MTP head built-in, sliding-window attention. Fastest option. |
+| [Qwen3.6-35B-A3B-MTP](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | IQ2_M (~12 GB) | ~2500 MiB | **23.3** | 256 MoE experts, Chimera dual-backend, MTP speculative. Most params per VRAM. |
+| [Qwen3.6-35B-A3B-UD](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-UD-GGUF) | Q2_K_XL (~12 GB) | ~2500 MiB | 20.0 | Baseline quant (non-MTP). Lower bit-width, higher throughput on very low VRAM. |
+
+**Bundled profiles:**
+```bash
+vitriol run --profile mellum2    # Mellum2 optimized (ngl=24, ctx=32768, lru=2048)
+vitriol run --profile icarus     # Qwen3.6 optimized (ngl=99, ctx=65536, pin=12, mtp=5)
+```
 
 | Metric | Value |
 |--------|-------|
@@ -341,7 +355,7 @@ See full sweep data in [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md#m
 
 | GPU | VRAM | Status | Notes |
 |-----|------|--------|-------|
-| GTX 1070 Ti | 8 GB | ✅ Verified | PCIe 3.0 x16, **23.3 tok/s** (Chimera, IQ2_M, MTP N=2, pin=8) — confirmed 2026-05-22 |
+| GTX 1070 Ti | 8 GB | ✅ Verified | PCIe 3.0 x16, **27.1 tok/s** (Mellum2 12B Q4_K_M) / **23.3 tok/s** (Qwen3.6 35B IQ2_M, Chimera, MTP N=2, pin=8) |
 | RTX 3060 | 12 GB | ✅ Supported | More VRAM for larger KV cache |
 | RTX 4090 | 24 GB | ✅ Supported | PCIe 4.0 x16 → higher bandwidth |
 | AMD RX 7000 | varies | ✅ Chimera (Vulkan) | Vulkan backend handles dense ops; MoE via CUDA not available |

@@ -1,0 +1,55 @@
+# VITRIOL Configuration — Mellum2 Default
+# Generated 2026-06-04
+# Model: Mellum2-12B-A2.5B-Instruct-Q4_K_M (Q4_K_M, 7.5 GB)
+# Hardware: GTX 1070 Ti (8GB) + 64GB DDR4
+# Optimal: ngl=24 ctx=32768 → 27 t/s
+
+[gpu]
+device = 0
+exclude_secondary = true
+
+[model]
+path = /home/randozart/Desktop/Projects/Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf
+context = 32768
+threads = 4
+ngl = 24
+expert_count = 0
+
+[vitriol]
+mode = stream
+lru_mb = 2048
+verbose = true
+output_cache = off
+predictive_prefetch = on
+pin_first_n_layers = 0
+prune_experts = 0
+reasoning = off
+
+[server]
+host = 0.0.0.0
+port = 8080
+parallel = 4
+
+[memory]
+mode = off
+semantic_mode = off
+
+[kv]
+mode = standard
+quant_mode = q4_0
+quant_mode_v = f16
+frozen_prompt = on
+
+[engine]
+mode = vitriol-dma
+ubatch_size = 128
+
+[lookup]
+tokens = 0
+
+[spec]
+type =
+draft_n_max = 0
+
+[chimera]
+mode = auto
