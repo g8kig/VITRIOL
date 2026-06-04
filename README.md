@@ -19,9 +19,12 @@ Regarding the name, in alchemy, vitriol was considered the ultimate catalyst for
 git clone --recursive https://github.com/your/vitriol.git
 # Or if already cloned: git submodule update --init --recursive
 
-# 2. Build
+# 2. Build (tests and examples excluded — see issue #1)
 cd vitriol/llama.cpp && cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
   && cmake --build build -j$(nproc)
+# Vulkan: optional — VITRIOL auto-detects at runtime. CUDA-only is fully supported.
+# Install Vulkan SDK and add -DGGML_VULKAN=ON for Chimera dual-backend mode.
 
 # 3. One-time capability grant
 ./vitriol setup
