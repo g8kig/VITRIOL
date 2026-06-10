@@ -1241,6 +1241,23 @@ setup_caps() {
     echo "                             $(free -g | awk '/^Mem:/{print int($2*0.8)}') GiB available without swap pressure"
 }
 
+fix_rpath() {
+    local dir="${1}"
+    if [[ ! -d "$dir" ]]; then
+        return
+    fi
+    echo "→ Fixing RUNPATH in $dir (replacing \$ORIGIN with absolute path)"
+    local count=0
+    for f in "$dir"/llama-server "$dir"/llama-cli "$dir"/llama-bench "$dir"/lib*.so*; do
+        [[ -f "$f" ]] || continue
+        if patchelf --set-rpath "$dir" "$f" 2>/dev/null; then
+            count=$((count + 1))
+        fi
+    done
+    echo "  ✓ Fixed $count ELF files"
+    echo ""
+}
+
 usage() {
     print_header
     cat <<'HEREDOC'
@@ -2402,15 +2419,23 @@ DISK_OFFLOAD="${CLI_DISK_OFFLOAD:-0}"
         ;;
 
     setup)
-        setup_caps "$BINARY"
+        BUILD_DIR="${LLAMA_DIR}/build/bin"
+
+        if [[ -x "$BINARY" ]]; then
+            setup_caps "$BINARY"
+        fi
         if [[ -x "$SERVER_BINARY" ]]; then
             setup_caps "$SERVER_BINARY"
         fi
         # Also set caps on llama-bench if it exists
-        BENCH_BINARY="${LLAMA_DIR}/build/bin/llama-bench"
+        BENCH_BINARY="${BUILD_DIR}/llama-bench"
         if [[ -x "$BENCH_BINARY" ]]; then
             setup_caps "$BENCH_BINARY"
         fi
+
+        # Fix RUNPATH: $ORIGIN doesn't expand under AT_SECURE (file capabilities)
+        # Replace $ORIGIN with the absolute build path so libraries are found.
+        fix_rpath "$BUILD_DIR"
         ;;
 
     help|--help|-h)
